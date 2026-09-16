@@ -20,7 +20,7 @@ COPY codex_rosetta/ codex_rosetta/
 COPY --from=web-builder /build/web/dist/ web/dist/
 
 # Install (includes the package itself and web/dist)
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[redis]"
 RUN mkdir -p /app/data
 
 # Default environment

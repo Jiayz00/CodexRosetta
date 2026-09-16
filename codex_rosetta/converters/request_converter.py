@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from codex_rosetta.converters.content_transformer import ContentTransformer
@@ -110,7 +111,17 @@ class RequestConverter:
             context.original_text_format = text_config
             fmt = text_config.get("format")
             if fmt:
-                chat_request["response_format"] = fmt
+                if isinstance(fmt, dict) and fmt.get("type") == "json_schema":
+                    # Many Chat Completions upstreams reject
+                    # `response_format: {"type": "json_schema"}` outright
+                    # ("This response_format type is unavailable now").
+                    # Enforce the schema through the system prompt instead
+                    # of forwarding a parameter the upstream cannot honour.
+                    schema_hint = self._build_json_schema_hint(fmt)
+                    if schema_hint:
+                        self._apply_system_hint(messages, schema_hint)
+                else:
+                    chat_request["response_format"] = fmt
 
         # Reasoning -> reasoning_effort
         reasoning = responses_request.get("reasoning")
@@ -179,6 +190,38 @@ class RequestConverter:
                 msg["content"] += f"\n{hint}"
                 return
 
+        messages.insert(0, {"role": "system", "content": hint})
+
+    @staticmethod
+    def _build_json_schema_hint(fmt: dict[str, Any]) -> str:
+        """Render a system-prompt instruction that enforces a JSON Schema."""
+        schema = fmt.get("schema")
+        if not isinstance(schema, dict) or not schema:
+            return ""
+        try:
+            schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return ""
+        header = (
+            "You must respond with a single JSON value that strictly conforms "
+            "to the following JSON Schema"
+        )
+        name = fmt.get("name")
+        if isinstance(name, str) and name:
+            header += f" (schema name: {name})"
+        header += (
+            ". Return the raw JSON only: no prose, no markdown code fences "
+            "and no extra keys.\n\nJSON Schema:\n"
+        )
+        return header + schema_text
+
+    @staticmethod
+    def _apply_system_hint(messages: list[dict[str, Any]], hint: str) -> None:
+        """Append an instruction hint to the leading system message."""
+        for msg in messages:
+            if msg.get("role") == "system" and isinstance(msg.get("content"), str):
+                msg["content"] += f"\n\n{hint}"
+                return
         messages.insert(0, {"role": "system", "content": hint})
 
     @staticmethod

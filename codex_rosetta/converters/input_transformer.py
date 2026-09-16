@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from codex_rosetta.converters.content_transformer import ContentTransformer
@@ -47,6 +48,7 @@ class InputTransformer:
         messages: list[dict[str, Any]] = []
         pending_assistant: dict[str, Any] | None = None
         pending_tool_calls: list[dict[str, Any]] = []
+        pending_reasoning = ""
 
         for item in items:
             if not isinstance(item, dict):
@@ -63,9 +65,17 @@ class InputTransformer:
                 if role in ("user", "system", "developer"):
                     # Flush any pending assistant + tool calls
                     if pending_assistant is not None:
-                        self._flush_assistant(messages, pending_assistant, pending_tool_calls)
+                        self._flush_assistant(
+                            messages,
+                            pending_assistant,
+                            pending_tool_calls,
+                            reasoning_content=pending_reasoning,
+                        )
                         pending_assistant = None
                         pending_tool_calls = []
+                    # Reasoning that never reached an assistant turn must
+                    # not leak into a later one.
+                    pending_reasoning = ""
 
                     mapped_role = "system" if role == "developer" else role
                     converted_content = self._ct.responses_input_to_chat_content(content)
@@ -75,15 +85,34 @@ class InputTransformer:
                     messages.append(msg)
 
                 elif role == "assistant":
+                    converted_content = self._ct.responses_input_to_chat_content(content)
+                    if not converted_content:
+                        # Codex interleaves empty assistant placeholders
+                        # with tool calls. Opening a new turn here splits
+                        # the tool calls from their results, which
+                        # upstreams reject with "An assistant message with
+                        # 'tool_calls' must be followed by tool messages".
+                        continue
+
                     # Flush previous pending assistant
                     if pending_assistant is not None:
-                        self._flush_assistant(messages, pending_assistant, pending_tool_calls)
+                        self._flush_assistant(
+                            messages,
+                            pending_assistant,
+                            pending_tool_calls,
+                            reasoning_content=pending_reasoning,
+                        )
                         pending_tool_calls = []
+                        pending_reasoning = ""
 
-                    converted_content = self._ct.responses_input_to_chat_content(content)
                     pending_assistant = {"role": "assistant", "content": converted_content}
 
             elif item_type == "function_call":
+                if pending_assistant is None:
+                    # A tool call can arrive without a preceding assistant
+                    # message item. Without one, the following `tool`
+                    # message would be orphaned and rejected upstream.
+                    pending_assistant = {"role": "assistant", "content": None}
                 tc: dict[str, Any] = {
                     "id": item.get("call_id", item.get("id", "")),
                     "type": "function",
@@ -97,9 +126,15 @@ class InputTransformer:
             elif item_type == "function_call_output":
                 # Flush pending assistant first
                 if pending_assistant is not None:
-                    self._flush_assistant(messages, pending_assistant, pending_tool_calls)
+                    self._flush_assistant(
+                        messages,
+                        pending_assistant,
+                        pending_tool_calls,
+                        reasoning_content=pending_reasoning,
+                    )
                     pending_assistant = None
                     pending_tool_calls = []
+                    pending_reasoning = ""
 
                 call_id = item.get("call_id", "")
                 output = item.get("output", "")
@@ -112,21 +147,34 @@ class InputTransformer:
                 })
 
             elif item_type == "custom_tool_call":
+                if pending_assistant is None:
+                    pending_assistant = {"role": "assistant", "content": None}
+                # Custom tools are advertised to the upstream as functions
+                # (see ToolTransformer._convert_custom_tool), so the
+                # historical tool call has to use the same shape.
                 tc: dict[str, Any] = {
                     "id": item.get("call_id", item.get("id", "")),
-                    "type": "custom",
-                    "custom": {
+                    "type": "function",
+                    "function": {
                         "name": item.get("name", ""),
-                        "input": item.get("input", ""),
+                        "arguments": json.dumps(
+                            {"input": item.get("input", "")}, ensure_ascii=False
+                        ),
                     },
                 }
                 pending_tool_calls.append(tc)
 
             elif item_type == "custom_tool_call_output":
                 if pending_assistant is not None:
-                    self._flush_assistant(messages, pending_assistant, pending_tool_calls)
+                    self._flush_assistant(
+                        messages,
+                        pending_assistant,
+                        pending_tool_calls,
+                        reasoning_content=pending_reasoning,
+                    )
                     pending_assistant = None
                     pending_tool_calls = []
+                    pending_reasoning = ""
 
                 call_id = item.get("call_id", "")
                 output = item.get("output", "")
@@ -138,13 +186,24 @@ class InputTransformer:
                     "content": output if output is not None else "",
                 })
 
+            elif item_type == "reasoning":
+                # Thinking-mode upstreams (DeepSeek, GLM, ...) require the
+                # reasoning text back as `reasoning_content` on the
+                # assistant message. Dropping these items made every
+                # follow-up turn fail with "The `reasoning_content` in the
+                # thinking mode must be passed back to the API."
+                reasoning_text = _extract_reasoning_text(item)
+                if reasoning_text:
+                    pending_reasoning = "\n".join(
+                        part for part in (pending_reasoning, reasoning_text) if part
+                    )
+
             elif item_type in (
                 "web_search_call",
                 "file_search_call",
                 "computer_call",
                 "code_interpreter_call",
                 "image_generation_call",
-                "reasoning",
                 "mcp_call",
             ):
                 # Built-in tool output items in input context — skip
@@ -153,7 +212,12 @@ class InputTransformer:
 
         # Flush final pending assistant
         if pending_assistant is not None:
-            self._flush_assistant(messages, pending_assistant, pending_tool_calls)
+            self._flush_assistant(
+                messages,
+                pending_assistant,
+                pending_tool_calls,
+                reasoning_content=pending_reasoning,
+            )
 
         return messages
 
@@ -162,9 +226,33 @@ class InputTransformer:
         messages: list[dict[str, Any]],
         assistant_msg: dict[str, Any],
         tool_calls: list[dict[str, Any]],
+        reasoning_content: str = "",
     ) -> None:
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
             if assistant_msg.get("content") == "" or assistant_msg.get("content") is None:
                 assistant_msg["content"] = None
+        if reasoning_content:
+            assistant_msg["reasoning_content"] = reasoning_content
+        if not tool_calls and not assistant_msg.get("content"):
+            # Nothing to say and no tool call to make. Emitting it would sit
+            # between a tool_calls message and its tool result.
+            return
         messages.append(assistant_msg)
+
+
+def _extract_reasoning_text(item: dict[str, Any]) -> str:
+    """Collect the plain text carried by a Responses API ``reasoning`` item."""
+    parts: list[str] = []
+    for field in ("summary", "content"):
+        entries = item.get(field)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict):
+                text = entry.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+            elif isinstance(entry, str) and entry:
+                parts.append(entry)
+    return "\n".join(parts)

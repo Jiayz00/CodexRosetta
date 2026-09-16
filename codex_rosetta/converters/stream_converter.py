@@ -267,14 +267,14 @@ class StreamConverter:
             }
 
         reasoning_delta = {
-            "type": "response.reasoning.delta",
+            "type": "response.reasoning_text.delta",
             "output_index": reasoning_item.output_index,
             "item_id": reasoning_item.item_id,
             "delta": reasoning_text,
             "sequence_number": self._state.next_sequence_number(),
         }
-        self._record("response.reasoning.delta", reasoning_delta)
-        yield "response.reasoning.delta", reasoning_delta
+        self._record("response.reasoning_text.delta", reasoning_delta)
+        yield "response.reasoning_text.delta", reasoning_delta
 
         reasoning_item.accumulated_text += reasoning_text
 

@@ -71,14 +71,30 @@ class TestParameterMapping:
 
 class TestTextFormatMapping:
     @pytest.mark.asyncio
-    async def test_text_format_to_response_format(self, rc):
+    async def test_json_schema_is_not_forwarded_as_response_format(self, rc):
+        """`response_format: json_schema` is rejected by many Chat Completions
+        upstreams, so the schema is enforced via the system prompt instead.
+        See tests/test_chat_completions_compat.py for the full coverage."""
+        text_format = {"type": "json_schema", "schema": {"type": "object"}}
         chat_req, ctx = await rc.convert({
             "model": "gpt-4o",
             "input": "Hi",
-            "text": {"format": {"type": "json_schema", "schema": {"type": "object"}}},
+            "text": {"format": text_format},
         })
-        assert chat_req["response_format"] == {"type": "json_schema", "schema": {"type": "object"}}
-        assert ctx.original_text_format == {"format": {"type": "json_schema", "schema": {"type": "object"}}}
+        assert "response_format" not in chat_req
+        assert ctx.original_text_format == {"format": text_format}
+        assert "JSON Schema" in chat_req["messages"][0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_json_object_is_forwarded_as_response_format(self, rc):
+        text_format = {"type": "json_object"}
+        chat_req, ctx = await rc.convert({
+            "model": "gpt-4o",
+            "input": "Hi",
+            "text": {"format": text_format},
+        })
+        assert chat_req["response_format"] == text_format
+        assert ctx.original_text_format == {"format": text_format}
 
 
 class TestReasoningMapping:
