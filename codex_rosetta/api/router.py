@@ -16,7 +16,12 @@ from codex_rosetta.config import get_settings
 from codex_rosetta.converters.request_converter import RequestConverter
 from codex_rosetta.converters.response_converter import ResponseConverter
 from codex_rosetta.converters.stream_converter import StreamConverter
-from codex_rosetta.models.common import is_simulated_function, extract_original_type, ROSETTA_TOOL_PREFIX
+from codex_rosetta.models.common import (
+    ROSETTA_TOOL_PREFIX,
+    UnsupportedParameterError,
+    extract_original_type,
+    is_simulated_function,
+)
 from codex_rosetta.search.base import SearchProvider
 from codex_rosetta.search.formatter import format_search_results
 from codex_rosetta.utils.logging import get_logger
@@ -105,7 +110,13 @@ async def create_response(request: Request):
             conversation_messages = await store.retrieve_by_conversation_id(conv_id)
             log.debug("conversation_resolved", via="conversation", conversation_id=conv_id, found=conversation_messages is not None)
 
-    chat_request, context = await request_converter.convert(body, conversation_messages, auditor=auditor)
+    try:
+        chat_request, context = await request_converter.convert(
+            body, conversation_messages, auditor=auditor
+        )
+    except UnsupportedParameterError as exc:
+        log.warning("unsupported_parameter", param=exc.param, message=exc.message)
+        return JSONResponse(status_code=400, content=exc.to_error_body())
 
     log.info(
         "request_converted",
@@ -737,16 +748,25 @@ async def _stream_response_passthrough(
 
 
 def _make_error_response(response_id: str, code: str, message: str) -> dict[str, Any]:
+    """Full Response-shaped failure envelope (not just a bare error object)."""
+    from codex_rosetta.utils.id_generation import unix_timestamp
+
     return {
         "id": response_id,
         "object": "response",
+        "created_at": unix_timestamp(),
+        "completed_at": None,
+        "model": "",
         "status": "failed",
         "error": {"code": code, "message": message},
+        "incomplete_details": None,
         "output": [],
         "usage": {
             "input_tokens": 0,
             "output_tokens": 0,
             "total_tokens": 0,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
         },
     }
 

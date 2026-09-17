@@ -4,10 +4,13 @@ from typing import Any
 
 from codex_rosetta.converters.content_transformer import ContentTransformer
 from codex_rosetta.models.common import (
+    EMPTY_ARGUMENTS,
     ConversionContext,
+    derive_phase,
     is_simulated_function,
     extract_original_type,
 )
+from codex_rosetta.models.responses_api import build_response_envelope
 from codex_rosetta.utils.id_generation import generate_item_id, unix_timestamp
 
 
@@ -44,28 +47,38 @@ class ResponseConverter:
         # Truncate tool calls if max_tool_calls is set
         self._truncate_tool_calls(output_items, context)
 
-        response: dict[str, Any] = {
-            "id": context.response_id,
-            "object": "response",
-            "created_at": created_at,
-            "completed_at": unix_timestamp(),
-            "model": context.model or chat_response.get("model", ""),
-            "status": "completed",
-            "output": output_items,
-            "usage": usage,
-        }
-
-        # Carry over instructions if present
-        if context.original_instructions:
-            response["instructions"] = context.original_instructions
-
-        # Carry over error if present
         error = chat_response.get("error")
         if error:
-            response["error"] = error
-            response["status"] = "failed"
+            status = "failed"
+            incomplete_details = None
+        else:
+            status, incomplete_details = self._status_for(self._finish_reason(choices))
 
-        return response
+        return build_response_envelope(
+            context,
+            output=output_items,
+            status=status,
+            usage=usage,
+            error=error,
+            incomplete_details=incomplete_details,
+            created_at=created_at,
+            completed_at=None if status == "failed" else unix_timestamp(),
+        )
+
+    @staticmethod
+    def _finish_reason(choices: list[dict[str, Any]]) -> str | None:
+        for choice in choices:
+            if choice.get("finish_reason"):
+                return choice["finish_reason"]
+        return None
+
+    @staticmethod
+    def _status_for(finish_reason: str | None) -> tuple[str, dict[str, Any] | None]:
+        if finish_reason == "length":
+            return "incomplete", {"reason": "max_output_tokens"}
+        if finish_reason == "content_filter":
+            return "incomplete", {"reason": "content_filter"}
+        return "completed", None
 
     def _convert_message_to_output_items(
         self,
@@ -105,15 +118,18 @@ class ResponseConverter:
             if refusal_part:
                 content_parts.append(refusal_part)
 
-        # Create the message output item (even if content is empty)
-        msg_item: dict[str, Any] = {
-            "type": "message",
-            "id": generate_item_id("message"),
-            "role": "assistant",
-            "status": "completed",
-            "content": content_parts,
-        }
-        items.append(msg_item)
+        # Only emit an assistant message item when it actually carries content.
+        # Empty message items make Codex render every tool round as a separate
+        # assistant turn instead of folding it into one working block.
+        if content_parts:
+            items.append({
+                "type": "message",
+                "id": generate_item_id("message"),
+                "role": "assistant",
+                "status": "completed",
+                "content": content_parts,
+                "phase": derive_phase(bool(tool_calls)),
+            })
 
         # Create function_call output items
         for tc in tool_calls:
@@ -136,20 +152,25 @@ class ResponseConverter:
         if tc_type == "function":
             func = tool_call.get("function", {})
             name = func.get("name", "")
-            arguments = func.get("arguments", "{}")
+            # Normalise an empty/missing value so the client always sees valid JSON.
+            arguments = func.get("arguments") or EMPTY_ARGUMENTS
 
             # Check if this maps to a simulated built-in tool
             if is_simulated_function(name):
                 return self._convert_simulated_builtin(name, arguments, call_id, context)
 
-            return {
+            client_name, namespace = context.resolve_output_name(name)
+            item: dict[str, Any] = {
                 "type": "function_call",
                 "id": generate_item_id("function_call"),
                 "call_id": call_id,
-                "name": name,
+                "name": client_name,
                 "arguments": arguments,
                 "status": "completed",
             }
+            if namespace:
+                item["namespace"] = namespace
+            return item
 
         elif tc_type == "custom":
             custom = tool_call.get("custom", {})
@@ -277,22 +298,11 @@ class ResponseConverter:
 
         for field in context.include_fields:
             if field == "reasoning.encrypted_content":
-                # Add a reasoning item with null encrypted_content if not present
-                has_reasoning = any(
-                    item.get("type") == "reasoning" for item in output_items
-                )
-                if not has_reasoning:
-                    output_items.append({
-                        "type": "reasoning",
-                        "id": generate_item_id("reasoning"),
-                        "summary": [],
-                        "encrypted_content": None,
-                        "status": "completed",
-                    })
-                else:
-                    for item in output_items:
-                        if item.get("type") == "reasoning":
-                            item.setdefault("encrypted_content", None)
+                # Never fabricate an empty reasoning item — Codex would render a
+                # phantom reasoning block. Real items already carry the field.
+                for item in output_items:
+                    if item.get("type") == "reasoning":
+                        item.setdefault("encrypted_content", None)
 
             elif field == "message.output_text.logprobs":
                 for item in output_items:

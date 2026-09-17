@@ -72,14 +72,14 @@ class TestFunctionCallGrouping:
         result = tf.transform_input([
             {"type": "message", "role": "user", "content": "Weather in SF?"},
             {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Let me check."}]},
-            {"type": "function_call", "name": "get_weather", "call_id": "call_abc", "arguments": '{"location":"SF"}'},
+            {"type": "function_call", "name": "get_weather", "call_id": "call_abc000000000000000000000000", "arguments": '{"location":"SF"}'},
         ])
         # Should be: user msg + assistant msg with tool_calls
         assert len(result) == 2
         assert result[1]["role"] == "assistant"
         assert result[1]["content"] == "Let me check."
         assert len(result[1]["tool_calls"]) == 1
-        assert result[1]["tool_calls"][0]["id"] == "call_abc"
+        assert result[1]["tool_calls"][0]["id"] == "call_abc000000000000000000000000"
         assert result[1]["tool_calls"][0]["function"]["name"] == "get_weather"
         assert result[1]["tool_calls"][0]["function"]["arguments"] == '{"location":"SF"}'
 
@@ -87,22 +87,22 @@ class TestFunctionCallGrouping:
     async def test_function_call_output(self, tf):
         result = tf.transform_input([
             {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Let me check."}]},
-            {"type": "function_call", "name": "get_weather", "call_id": "call_abc", "arguments": '{"location":"SF"}'},
-            {"type": "function_call_output", "call_id": "call_abc", "output": '{"temp":72}'},
+            {"type": "function_call", "name": "get_weather", "call_id": "call_abc000000000000000000000000", "arguments": '{"location":"SF"}'},
+            {"type": "function_call_output", "call_id": "call_abc000000000000000000000000", "output": '{"temp":72}'},
         ])
         # assistant msg + tool msg
         assert len(result) == 2
         assert result[0]["role"] == "assistant"
-        assert result[0]["tool_calls"][0]["id"] == "call_abc"
+        assert result[0]["tool_calls"][0]["id"] == "call_abc000000000000000000000000"
         assert result[1]["role"] == "tool"
-        assert result[1]["tool_call_id"] == "call_abc"
+        assert result[1]["tool_call_id"] == "call_abc000000000000000000000000"
         assert result[1]["content"] == '{"temp":72}'
 
     @pytest.mark.asyncio
     async def test_assistant_with_null_content_and_tool_calls(self, tf):
         result = tf.transform_input([
             {"type": "message", "role": "assistant", "content": None},
-            {"type": "function_call", "name": "get_weather", "call_id": "call_1", "arguments": '{}'},
+            {"type": "function_call", "name": "get_weather", "call_id": "call_1000000000000000000000000", "arguments": '{}'},
         ])
         assert result[0]["role"] == "assistant"
         assert result[0]["content"] is None
@@ -112,12 +112,12 @@ class TestFunctionCallGrouping:
     async def test_parallel_tool_calls(self, tf):
         result = tf.transform_input([
             {"type": "message", "role": "assistant", "content": None},
-            {"type": "function_call", "name": "get_weather", "call_id": "call_1", "arguments": '{"location":"SF"}'},
-            {"type": "function_call", "name": "get_weather", "call_id": "call_2", "arguments": '{"location":"NYC"}'},
+            {"type": "function_call", "name": "get_weather", "call_id": "call_1000000000000000000000000", "arguments": '{"location":"SF"}'},
+            {"type": "function_call", "name": "get_weather", "call_id": "call_2111111111111111111111111", "arguments": '{"location":"NYC"}'},
         ])
         assert len(result[0]["tool_calls"]) == 2
-        assert result[0]["tool_calls"][0]["id"] == "call_1"
-        assert result[0]["tool_calls"][1]["id"] == "call_2"
+        assert result[0]["tool_calls"][0]["id"] == "call_1000000000000000000000000"
+        assert result[0]["tool_calls"][1]["id"] == "call_2111111111111111111111111"
 
     @pytest.mark.asyncio
     async def test_full_tool_call_lifecycle(self, tf):
@@ -125,8 +125,8 @@ class TestFunctionCallGrouping:
         result = tf.transform_input([
             {"type": "message", "role": "user", "content": "Weather in SF?"},
             {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Checking..."}]},
-            {"type": "function_call", "name": "get_weather", "call_id": "call_abc", "arguments": '{"location":"SF"}'},
-            {"type": "function_call_output", "call_id": "call_abc", "output": '{"temp":72}'},
+            {"type": "function_call", "name": "get_weather", "call_id": "call_abc000000000000000000000000", "arguments": '{"location":"SF"}'},
+            {"type": "function_call_output", "call_id": "call_abc000000000000000000000000", "output": '{"temp":72}'},
             {"type": "message", "role": "user", "content": "Thanks!"},
         ])
         # user, assistant+tool_calls, tool, user
@@ -142,14 +142,25 @@ class TestFunctionCallOutputWithListContent:
     @pytest.mark.asyncio
     async def test_function_call_output_with_list_content(self, tf):
         result = tf.transform_input([
-            {"type": "function_call_output", "call_id": "call_1", "output": [
+            {"type": "function_call", "name": "get_weather", "call_id": "call_1000000000000000000000000", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1000000000000000000000000", "output": [
                 {"type": "output_text", "text": "line1"},
                 {"type": "output_text", "text": "line2"},
             ]},
         ])
-        assert result[0]["role"] == "tool"
-        assert "line1" in result[0]["content"]
-        assert "line2" in result[0]["content"]
+        assert result[1]["role"] == "tool"
+        assert "line1" in result[1]["content"]
+        assert "line2" in result[1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_orphan_function_call_output_becomes_user_message(self, tf):
+        """An output whose matching call is absent must not become a bare tool message."""
+        result = tf.transform_input([
+            {"type": "function_call_output", "call_id": "", "output": "<codex_delegation>spawn</codex_delegation>"},
+        ])
+        assert result[0]["role"] == "user"
+        assert "codex_delegation" in result[0]["content"]
+        assert all(m.get("tool_call_id") != "" for m in result)
 
 
 class TestMixedContent:

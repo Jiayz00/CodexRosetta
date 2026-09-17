@@ -64,12 +64,14 @@ class TestTextOnlyStreaming:
         assert "response.output_item.done" in event_types
         assert "response.completed" in event_types
 
-        # Check delta content (first chunk has empty content "")
+        # The role-only frame carries content="" and must NOT produce a message
+        # item or an empty text delta (that is what broke Codex work-block folding).
         deltas = [e[1] for e in events if e[0] == "response.output_text.delta"]
-        assert len(deltas) == 3
-        assert deltas[0]["delta"] == ""
-        assert deltas[1]["delta"] == "Hello"
-        assert deltas[2]["delta"] == " world"
+        assert len(deltas) == 2
+        assert [d["delta"] for d in deltas] == ["Hello", " world"]
+        assert all(d["delta"] != "" for d in deltas)
+        added_items = [e[1]["item"] for e in events if e[0] == "response.output_item.added"]
+        assert len(added_items) == 1
 
         # Check done text is accumulated
         done_events = [e[1] for e in events if e[0] == "response.output_text.done"]

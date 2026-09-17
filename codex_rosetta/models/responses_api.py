@@ -90,3 +90,68 @@ class ResponsesApiResponse(BaseModel):
     parallel_tool_calls: bool | None = None
 
     model_config = {"extra": "allow"}
+
+# Request fields echoed back on the Response object, per the Responses API contract.
+_ECHOED_REQUEST_FIELDS = (
+    "instructions",
+    "tools",
+    "tool_choice",
+    "temperature",
+    "top_p",
+    "max_output_tokens",
+    "metadata",
+    "previous_response_id",
+    "parallel_tool_calls",
+    "prompt_cache_key",
+    "reasoning",
+    "text",
+    "truncation",
+    "store",
+    "service_tier",
+    "safety_identifier",
+    "user",
+)
+
+
+def build_response_envelope(
+    context: Any,
+    *,
+    output: list[dict[str, Any]],
+    status: str = "completed",
+    usage: dict[str, Any] | None = None,
+    error: dict[str, Any] | None = None,
+    incomplete_details: dict[str, Any] | None = None,
+    created_at: float | None = None,
+    completed_at: float | None = None,
+) -> dict[str, Any]:
+    """Build a Responses API envelope shared by the streaming and non-streaming paths.
+
+    Always carries ``error``/``incomplete_details``/``completed_at``/``usage``/
+    ``status``/``output`` so both paths produce the same shape, and echoes back
+    every request field the gateway accepted.
+    """
+    from codex_rosetta.utils.id_generation import unix_timestamp
+
+    response: dict[str, Any] = {
+        "id": context.response_id,
+        "object": "response",
+        "created_at": created_at if created_at is not None else unix_timestamp(),
+        "completed_at": completed_at,
+        "model": context.model,
+        "status": status,
+        "output": output,
+        "error": error,
+        "incomplete_details": incomplete_details,
+        "usage": usage,
+    }
+
+    original = getattr(context, "original_request", None) or {}
+    for field_name in _ECHOED_REQUEST_FIELDS:
+        value = original.get(field_name)
+        if value is not None:
+            response[field_name] = value
+
+    if "instructions" not in response and context.original_instructions:
+        response["instructions"] = context.original_instructions
+
+    return response
