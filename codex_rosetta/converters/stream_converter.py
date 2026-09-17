@@ -57,6 +57,8 @@ class StreamConverter:
             if not self._item_included_in_output(item):
                 continue
             if item.item_type == "message":
+                if not item.accumulated_text:
+                    continue
                 item_status = "incomplete" if is_incomplete else "completed"
                 msg: dict[str, Any] = {
                     "type": "message",
@@ -69,6 +71,8 @@ class StreamConverter:
                     msg["incomplete_details"] = {"reason": "max_output_tokens"}
                 items.append(msg)
             elif item.item_type == "reasoning":
+                if not item.accumulated_text:
+                    continue
                 summary = _build_reasoning_summary(item.accumulated_text)
                 items.append({
                     "type": "reasoning",
@@ -298,7 +302,17 @@ class StreamConverter:
     async def _handle_text_delta(
         self, text: str
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-        """Handle a text content delta, emitting appropriate Responses events."""
+        """Handle a text content delta, emitting appropriate Responses events.
+
+        Empty deltas are dropped: upstream chat-completions sends
+        ``{"role": "assistant", "content": ""}`` as the first frame of every
+        round, and materializing a message item for it makes the Codex client
+        render a spurious empty assistant message after each tool call, which
+        breaks its grouping of consecutive commands into one work block.
+        """
+        if not text:
+            return
+
         msg_item = self._state.get_current_message_item()
 
         if msg_item is None:
@@ -347,7 +361,16 @@ class StreamConverter:
     async def _handle_reasoning_delta(
         self, reasoning_text: str
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-        """Handle a reasoning_content delta, mapping to Responses API reasoning item."""
+        """Handle a reasoning_content delta, mapping to a reasoning item.
+
+        The text is exposed through the official reasoning summary event family
+        (``response.reasoning_summary_*``) so clients that only implement the
+        documented Responses API contract can render it; chat-completions
+        providers (GLM, DeepSeek, ...) only send a flat ``reasoning_content``.
+        """
+        if not reasoning_text:
+            return
+
         reasoning_item = self._state.get_current_reasoning_item()
 
         if reasoning_item is None:
@@ -369,15 +392,27 @@ class StreamConverter:
                 "sequence_number": self._state.next_sequence_number(),
             }
 
+        if not reasoning_item.has_content_part_added:
+            reasoning_item.has_content_part_added = True
+            yield "response.reasoning_summary_part.added", {
+                "type": "response.reasoning_summary_part.added",
+                "output_index": reasoning_item.output_index,
+                "item_id": reasoning_item.item_id,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""},
+                "sequence_number": self._state.next_sequence_number(),
+            }
+
         reasoning_delta = {
-            "type": "response.reasoning.delta",
+            "type": "response.reasoning_summary_text.delta",
             "output_index": reasoning_item.output_index,
             "item_id": reasoning_item.item_id,
+            "summary_index": 0,
             "delta": reasoning_text,
             "sequence_number": self._state.next_sequence_number(),
         }
-        self._record("response.reasoning.delta", reasoning_delta)
-        yield "response.reasoning.delta", reasoning_delta
+        self._record("response.reasoning_summary_text.delta", reasoning_delta)
+        yield "response.reasoning_summary_text.delta", reasoning_delta
 
         reasoning_item.accumulated_text += reasoning_text
 
@@ -564,7 +599,15 @@ class StreamConverter:
     async def _finalize_message_item(
         self, item: OutputItemState
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-        """Emit done events for a message output item."""
+        """Emit done events for a message output item.
+
+        Message items only carry non-empty text, so an item without text (for
+        example a refusal-only turn) is dropped instead of being announced as
+        an empty assistant message.
+        """
+        if not item.accumulated_text:
+            return
+
         if item.has_content_part_added:
             yield "response.output_text.done", {
                 "type": "response.output_text.done",
@@ -613,20 +656,42 @@ class StreamConverter:
         self, item: OutputItemState
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         """Emit done events for a reasoning output item."""
-        if item.has_item_added:
-            summary = _build_reasoning_summary(item.accumulated_text)
-            yield "response.output_item.done", {
-                "type": "response.output_item.done",
+        if not item.has_item_added or not item.accumulated_text:
+            # Reasoning items are only created for non-empty deltas; this guard
+            # keeps empty items out of the stream and the final response.
+            return
+
+        if item.has_content_part_added:
+            yield "response.reasoning_summary_text.done", {
+                "type": "response.reasoning_summary_text.done",
                 "output_index": item.output_index,
-                "item": {
-                    "type": "reasoning",
-                    "id": item.item_id,
-                    "summary": summary,
-                    "encrypted_content": None,
-                    "status": "completed",
-                },
+                "item_id": item.item_id,
+                "summary_index": 0,
+                "text": item.accumulated_text,
                 "sequence_number": self._state.next_sequence_number(),
             }
+
+            yield "response.reasoning_summary_part.done", {
+                "type": "response.reasoning_summary_part.done",
+                "output_index": item.output_index,
+                "item_id": item.item_id,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": item.accumulated_text},
+                "sequence_number": self._state.next_sequence_number(),
+            }
+
+        yield "response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": item.output_index,
+            "item": {
+                "type": "reasoning",
+                "id": item.item_id,
+                "summary": _build_reasoning_summary(item.accumulated_text),
+                "encrypted_content": None,
+                "status": "completed",
+            },
+            "sequence_number": self._state.next_sequence_number(),
+        }
 
     async def _finalize_function_call_item(
         self, item: OutputItemState
@@ -707,6 +772,8 @@ class StreamConverter:
             if not self._item_included_in_output(item):
                 continue
             if item.item_type == "message":
+                if not item.accumulated_text:
+                    continue
                 output.append({
                     "type": "message",
                     "id": item.item_id,
@@ -717,6 +784,8 @@ class StreamConverter:
                     ],
                 })
             elif item.item_type == "reasoning":
+                if not item.accumulated_text:
+                    continue
                 summary = _build_reasoning_summary(item.accumulated_text)
                 output.append({
                     "type": "reasoning",
