@@ -32,6 +32,23 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@router.get("/v1/models")
+async def list_models() -> dict[str, Any]:
+    """Minimal model list.
+
+    Codex probes `GET {base_url}/models` for reachability and treats a 404 as a
+    misconfigured API prefix, so this answers 200 even when no model is
+    configured. Model selection itself is driven by the client's own catalog.
+    """
+    model_id = get_settings().MODELS_MODEL_ID.strip()
+    data = (
+        [{"id": model_id, "object": "model", "owned_by": "codex-rosetta"}]
+        if model_id
+        else []
+    )
+    return {"object": "list", "data": data}
+
+
 def _get_search_provider() -> SearchProvider | None:
     s = get_settings()
     if not s.WEB_SEARCH_ENABLED:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from codex_rosetta.converters.content_transformer import ContentTransformer
+from codex_rosetta.models.common import ConversionContext
 
 
 class InputTransformer:
@@ -15,6 +17,7 @@ class InputTransformer:
         self,
         input_data: str | list[Any],
         instructions: str | None = None,
+        context: ConversionContext | None = None,
     ) -> list[dict[str, Any]]:
         """Convert Responses API input to Chat Completions messages.
 
@@ -23,6 +26,7 @@ class InputTransformer:
         - Array of typed items -> flat messages array
         - Grouping assistant messages with adjacent function_call items
         - function_call_output -> tool messages
+        - Namespaced function_call replay -> flattened upstream tool name
         - Instructions -> system message prepended
         """
         messages: list[dict[str, Any]] = []
@@ -38,12 +42,14 @@ class InputTransformer:
 
         # Array of items
         if isinstance(input_data, list):
-            assembled = self._assemble_messages_from_items(input_data)
+            assembled = self._assemble_messages_from_items(input_data, context)
             messages.extend(assembled)
 
         return messages
 
-    def _assemble_messages_from_items(self, items: list[Any]) -> list[dict[str, Any]]:
+    def _assemble_messages_from_items(
+        self, items: list[Any], context: ConversionContext | None = None
+    ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         pending_assistant: dict[str, Any] | None = None
         pending_tool_calls: list[dict[str, Any]] = []
@@ -84,11 +90,17 @@ class InputTransformer:
                     pending_assistant = {"role": "assistant", "content": converted_content}
 
             elif item_type == "function_call":
+                # Namespaced tools are replayed as a bare tool name plus a
+                # `namespace` field; upstream only ever saw the flattened name.
+                name = item.get("name", "")
+                namespace = item.get("namespace") or ""
+                if namespace and context is not None:
+                    name = context.flatten_namespace_tool(namespace, name)
                 tc: dict[str, Any] = {
                     "id": item.get("call_id", item.get("id", "")),
                     "type": "function",
                     "function": {
-                        "name": item.get("name", ""),
+                        "name": name,
                         "arguments": item.get("arguments", "{}"),
                     },
                 }
@@ -112,12 +124,14 @@ class InputTransformer:
                 })
 
             elif item_type == "custom_tool_call":
+                # Custom tools are exposed upstream as a single-string
+                # function, so replay them in that shape.
                 tc: dict[str, Any] = {
                     "id": item.get("call_id", item.get("id", "")),
-                    "type": "custom",
-                    "custom": {
+                    "type": "function",
+                    "function": {
                         "name": item.get("name", ""),
-                        "input": item.get("input", ""),
+                        "arguments": json.dumps({"input": item.get("input", "")}),
                     },
                 }
                 pending_tool_calls.append(tc)

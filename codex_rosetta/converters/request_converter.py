@@ -39,10 +39,18 @@ class RequestConverter:
         # Model
         chat_request["model"] = responses_request.get("model", "")
 
+        # Tools — converted before the input so that replayed namespaced tool
+        # calls can be mapped back to their flattened upstream names.
+        tools = responses_request.get("tools", [])
+        if tools:
+            chat_tools = self._tool_tf.convert_tools(tools, context)
+            if chat_tools:
+                chat_request["tools"] = chat_tools
+
         # Messages from input
         input_data = responses_request.get("input", "")
         instructions = responses_request.get("instructions")
-        messages = self._input_tf.transform_input(input_data, instructions)
+        messages = self._input_tf.transform_input(input_data, instructions, context)
 
         # If previous_response_id provided, prepend stored conversation history
         if conversation_messages:
@@ -52,13 +60,6 @@ class RequestConverter:
             messages = system_msgs + conversation_messages + non_system_msgs
 
         chat_request["messages"] = messages
-
-        # Tools
-        tools = responses_request.get("tools", [])
-        if tools:
-            chat_tools = self._tool_tf.convert_tools(tools, context)
-            if chat_tools:
-                chat_request["tools"] = chat_tools
 
         # Tool choice
         tool_choice = responses_request.get("tool_choice")

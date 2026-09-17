@@ -29,10 +29,21 @@ class ToolTransformer:
         if not responses_tools:
             return []
 
+        # Collect top-level function names first: flattened namespace tools must
+        # not collide with them no matter which order the client declared them.
+        for tool in responses_tools:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type", "function") == "function" and tool.get("name"):
+                context.top_level_tool_names.add(tool["name"])
+
         chat_tools: list[dict[str, Any]] = []
 
         for tool in responses_tools:
             tool_type = tool.get("type", "function")
+            if tool_type == "namespace":
+                chat_tools.extend(self._convert_namespace_tools(tool, context))
+                continue
             converted = self._convert_tool(tool, tool_type, context)
             if converted is not None:
                 chat_tools.append(converted)
@@ -49,7 +60,7 @@ class ToolTransformer:
             return self._convert_builtin_tool(tool, tool_type, context)
 
         elif tool_type == "custom":
-            return self._convert_custom_tool(tool)
+            return self._convert_custom_tool(tool, context)
 
         # Unknown tool type — try to pass through
         return None
@@ -274,18 +285,97 @@ class ToolTransformer:
             },
         }
 
-    def _convert_custom_tool(self, tool: dict[str, Any]) -> dict[str, Any]:
-        """Convert a custom tool to Chat Completions function format.
+    def _convert_namespace_tools(
+        self, tool: dict[str, Any], context: ConversionContext
+    ) -> list[dict[str, Any]]:
+        """Flatten a Responses ``namespace`` tool group into flat functions.
+
+        Chat Completions has no namespaced tools, so every nested function is
+        exposed as ``<namespace>__<tool>`` and recorded on the context; the
+        response converters put the ``namespace`` field back on the call item.
+        """
+        namespace = tool.get("name") or ""
+        namespace_description = tool.get("description") or ""
+
+        converted: list[dict[str, Any]] = []
+        for nested in tool.get("tools") or []:
+            if not isinstance(nested, dict):
+                continue
+            if nested.get("type", "function") != "function":
+                continue
+            tool_name = nested.get("name") or ""
+            if not tool_name:
+                continue
+
+            flat_name = self._unique_flat_name(namespace, tool_name, context)
+            context.register_namespace_tool(flat_name, namespace, tool_name)
+
+            description = nested.get("description") or namespace_description or ""
+            func_def: dict[str, Any] = {"name": flat_name}
+            if description:
+                func_def["description"] = (
+                    f"[{namespace}] {description}" if namespace else description
+                )
+            if "parameters" in nested:
+                func_def["parameters"] = nested["parameters"]
+            if "strict" in nested:
+                func_def["strict"] = nested["strict"]
+
+            converted.append({"type": "function", "function": func_def})
+
+        return converted
+
+    def _unique_flat_name(
+        self, namespace: str, tool_name: str, context: ConversionContext
+    ) -> str:
+        """Return a flat upstream name that no other tool has claimed."""
+        base = f"{namespace}__{tool_name}" if namespace else tool_name
+        candidate = base
+        suffix = 2
+        while (
+            candidate in context.namespace_tools
+            or candidate in context.top_level_tool_names
+        ):
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        return candidate
+
+    def _convert_custom_tool(
+        self, tool: dict[str, Any], context: ConversionContext
+    ) -> dict[str, Any]:
+        """Convert a custom (freeform) tool to a single-string function.
 
         Chat Completions API only supports ``type: "function"``. The previous
         implementation returned ``type: "custom"`` which is not understood by
         most upstream providers (e.g. litellm, vLLM) and causes 400 errors.
+
+        Freeform grammars cannot be expressed, so the tool is exposed as one
+        ``input`` string parameter; the response converters turn the resulting
+        call back into a ``custom_tool_call`` item.
         """
         custom = tool.get("custom", tool)
+        name = custom.get("name", "custom_tool")
+        context.custom_tool_names.add(name)
+
+        description = custom.get("description", "") or ""
+        if custom.get("format"):
+            description = (
+                f"{description}\nPass the tool input verbatim as the `input` string."
+            ).strip()
+
         func_def = {
-            "name": custom.get("name", "custom_tool"),
-            "description": custom.get("description", ""),
-            "parameters": {"type": "object", "properties": {}},
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "string",
+                        "description": "Raw tool input, passed to the tool verbatim.",
+                    }
+                },
+                "required": ["input"],
+            },
         }
         return {"type": "function", "function": func_def}
 
