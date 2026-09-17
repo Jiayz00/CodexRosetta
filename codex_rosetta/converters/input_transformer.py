@@ -426,11 +426,12 @@ class InputTransformer:
 
 def _extract_reasoning_text(item: dict[str, Any]) -> str:
     """Collect the plain text carried by a Responses API ``reasoning`` item."""
-    parts: list[str] = []
+    sections: list[str] = []
     for field in ("summary", "content"):
         entries = item.get(field)
         if not isinstance(entries, list):
             continue
+        parts: list[str] = []
         for entry in entries:
             if isinstance(entry, dict):
                 text = entry.get("text")
@@ -438,5 +439,8 @@ def _extract_reasoning_text(item: dict[str, Any]) -> str:
                     parts.append(text)
             elif isinstance(entry, str) and entry:
                 parts.append(entry)
-    # Reasoning parts are fragments of one stream, so they concatenate as-is.
-    return "".join(parts)
+        if parts:
+            # Entries within one field are fragments of the same stream.
+            sections.append("".join(parts))
+    # `summary` and `content` are separate sections.
+    return "\n".join(sections)
