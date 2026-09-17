@@ -101,11 +101,21 @@ CodexRosetta 支持 Responses API 的 `previous_response_id` 和 `conversation` 
 
 当 `WEB_SEARCH_ENABLED=true` 时，CodexRosetta 拦截 `__rosetta_web_search` 函数调用，查询配置的搜索服务商，并将搜索结果注入到对话中作为 tool 消息返回，然后继续请求上游模型生成回答——提供类似 OpenAI 原生联网搜索的体验。
 
-搜索结果以模拟流式方式输出（逐字符发送），使客户端能渐进式显示搜索结果。
+搜索过程对客户端完全可见：解析到查询参数时立即下发 `response.web_search_call.in_progress` / `.searching`，真实搜索结束后再下发带 `action.sources`（来源 URL）的 `.completed`。所有搜索轮次共用同一个 `StreamConverter`，因此响应 id、`sequence_number` 与 `output_index` 在整轮对话中保持连续，中间轮次的内容实时下发，而不是先缓冲整轮再回放。
 
 ### 多轮搜索
 
 当模型在同一个响应中多次调用 `web_search` 时，CodexRosetta 自动串联搜索轮次：拦截搜索调用 → 查询搜索 API → 将结果注入 → 重新请求上游 → 继续流式输出，所有这些都在单个 SSE 连接内完成，最多循环 `WEB_SEARCH_MAX_ROUNDS` 轮。
+
+搜索失败不会再把对话“卡死”：搜索凭证失效（401/403）、额度用尽（429/432）、限流、上游 5xx、网络超时会被分类，注入的 tool 消息会明确告知模型“搜索服务暂不可用（原因：…），请直接依据已有知识回答”。查询本身被搜索服务拒绝（400/422，例如只有 `site:` 操作符、没有检索词）单独归类为 `invalid_query`：凭证不会被冷却、也不会切换到下一条，tool 消息会提示模型改写检索词后重试。同一轮内连续 2 次搜索失败、或轮数达到 `WEB_SEARCH_MAX_ROUNDS` 后，CodexRosetta 会从后续请求的 tools 中摘除模拟搜索工具，强制模型作答；`web_search_call` 输出项在任何情况下都会被关闭，不会留下悬空调用。若同一轮里既有搜索调用又有客户端工具调用（如 shell、apply_patch），该轮原样交还客户端，不会被搜索循环吞掉。
+
+### 搜索凭证号池
+
+搜索凭证按优先级组成号池，持久化在 `data/search_pool.json`（不存在时自动从旧的 `WEB_SEARCH_PROVIDER` / `WEB_SEARCH_BASE_URL` / `WEB_SEARCH_API_KEY` 单项配置迁移）。
+
+- 单条凭证失败后会按错误类型进入冷却（`invalid_key` 24h、`quota_exceeded` 6h、`rate_limited` 60s、`upstream_error`/`network_error` 30s）；`invalid_query` 不进入冷却、不触发兜底。冷却期间直接跳到下一条，实现同 provider 多 key 与跨 provider 兜底；冷却是内存状态，重启清零，也可在 Web UI 里点「Test」手动恢复。
+- 管理接口：`GET/POST /v1/search-pool`、`PUT/DELETE /v1/search-pool/{id}`、`PUT /v1/search-pool/order`、`POST /v1/search-pool/{id}/test`。key 出参统一为 `***`，入参传 `***` 表示保持原值不变。
+- Web UI 的 Settings 页提供「Search Credential Pool」卡片：增删改、上下移排序、启用开关、冷却状态与单条测试。
 
 ### 内置工具模拟
 
@@ -209,9 +219,10 @@ codex_rosetta/
 | `WEB_SEARCH_API_KEY` | *（空）* | 搜索 API Key（`tavily`、`brave` 必填；`searxng`、`custom`、`duckduckgo` 可选） |
 | `WEB_SEARCH_MAX_RESULTS` | `5` | 每次查询最大搜索结果数 |
 | `WEB_SEARCH_MAX_ROUNDS` | `3` | 每个响应最大搜索轮次 |
-| `WEB_SEARCH_SIMULATED_STREAMING_ENABLED` | `true` | 逐字符流式输出搜索结果 |
-| `WEB_SEARCH_SIMULATED_STREAM_DELAY_MS` | `25` | 模拟流式输出每字符延迟（毫秒） |
-| `WEB_SEARCH_SIMULATED_STREAM_MAX_CHARS` | `32` | 模拟流式输出每块最大字符数 |
+| `SEARCH_POOL_FILE` | `data/search_pool.json` | 搜索凭证号池持久化路径 |
+| `WEB_SEARCH_SIMULATED_STREAMING_ENABLED` | `true` | **已废弃**：搜索轮次现在实时下发，仅为兼容旧 `.env` 保留 |
+| `WEB_SEARCH_SIMULATED_STREAM_DELAY_MS` | `25` | **已废弃**：同上 |
+| `WEB_SEARCH_SIMULATED_STREAM_MAX_CHARS` | `32` | **已废弃**：同上 |
 
 ### 日志与审计
 

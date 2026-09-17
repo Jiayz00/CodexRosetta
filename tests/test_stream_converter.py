@@ -43,6 +43,12 @@ class TestTextOnlyStreaming:
         ):
             events.append(evt)
 
+        # The empty-content frame must not materialize a message item: doing so
+        # used to make the Codex client render a spurious empty assistant
+        # message after every tool round, which stopped it from grouping
+        # consecutive commands into one folded work block.
+        assert [e[0] for e in events] == ["response.created", "response.in_progress"]
+
         # Text delta chunks
         async for evt in sc.process_chunk(make_chunk({"content": "Hello"})):
             events.append(evt)
@@ -64,12 +70,11 @@ class TestTextOnlyStreaming:
         assert "response.output_item.done" in event_types
         assert "response.completed" in event_types
 
-        # Check delta content (first chunk has empty content "")
+        # Check delta content: the empty role-only frame is dropped entirely
         deltas = [e[1] for e in events if e[0] == "response.output_text.delta"]
-        assert len(deltas) == 3
-        assert deltas[0]["delta"] == ""
-        assert deltas[1]["delta"] == "Hello"
-        assert deltas[2]["delta"] == " world"
+        assert len(deltas) == 2
+        assert deltas[0]["delta"] == "Hello"
+        assert deltas[1]["delta"] == " world"
 
         # Check done text is accumulated
         done_events = [e[1] for e in events if e[0] == "response.output_text.done"]
@@ -314,7 +319,7 @@ class TestMixedTextAndToolCalls:
 
 class TestRoundFiltering:
     @pytest.mark.asyncio
-    async def test_current_output_items_only_include_latest_round(self, ctx):
+    async def test_current_output_items_keep_search_items_and_latest_round(self, ctx):
         sim_name = make_simulated_function_name("web_search")
         ctx.register_builtin_tool(sim_name, "web_search")
 
@@ -336,11 +341,14 @@ class TestRoundFiltering:
             pass
 
         items = sc.current_output_items
-        assert [item["type"] for item in items] == ["message"]
-        assert items[0]["content"][0]["text"] == "Final answer"
+        # Built-in tool items survive the round transition so the client keeps
+        # the visible search history; chat items only reflect the last round.
+        assert [item["type"] for item in items] == ["web_search_call", "message"]
+        assert items[0]["action"]["queries"] == ["AI news"]
+        assert items[1]["content"][0]["text"] == "Final answer"
 
     @pytest.mark.asyncio
-    async def test_completed_response_only_includes_latest_round(self, ctx):
+    async def test_completed_response_includes_search_and_latest_round(self, ctx):
         sim_name = make_simulated_function_name("web_search")
         ctx.register_builtin_tool(sim_name, "web_search")
 
@@ -367,5 +375,168 @@ class TestRoundFiltering:
 
         completed = [event for event in events if event[0] == "response.completed"][0][1]
         output = completed["response"]["output"]
-        assert [item["type"] for item in output] == ["message"]
-        assert output[0]["content"][0]["text"] == "Final answer"
+        assert [item["type"] for item in output] == ["web_search_call", "message"]
+        assert output[0]["action"]["queries"] == ["AI news"]
+        assert output[1]["content"][0]["text"] == "Final answer"
+def _sequence_numbers(events):
+    return [
+        e[1]["sequence_number"]
+        for e in events
+        if isinstance(e[1], dict) and "sequence_number" in e[1]
+    ]
+
+
+class TestEmptyContentFrames:
+    @pytest.mark.asyncio
+    async def test_role_only_frame_creates_no_message_item(self, ctx):
+        sc = StreamConverter(ctx)
+        events = []
+
+        # Every upstream round opens with a role + empty content frame
+        async for evt in sc.process_chunk(make_chunk({"role": "assistant", "content": ""})):
+            events.append(evt)
+
+        async for evt in sc.process_chunk(make_chunk({
+            "tool_calls": [{
+                "index": 0,
+                "id": "call_abc",
+                "type": "function",
+                "function": {"name": "exec_command", "arguments": '{"cmd":"ls"}'},
+            }]
+        }, finish_reason="tool_calls")):
+            events.append(evt)
+
+        async for evt in sc.finalize():
+            events.append(evt)
+
+        event_types = [e[0] for e in events]
+        assert "response.content_part.added" not in event_types
+        assert "response.output_text.delta" not in event_types
+        assert "response.output_text.done" not in event_types
+        assert "response.content_part.done" not in event_types
+
+        added_items = [
+            e[1]["item"]["type"] for e in events if e[0] == "response.output_item.added"
+        ]
+        assert added_items == ["function_call"]
+
+        completed = [e[1] for e in events if e[0] == "response.completed"][0]
+        assert [item["type"] for item in completed["response"]["output"]] == ["function_call"]
+        assert [item["type"] for item in sc.current_output_items] == ["function_call"]
+
+    @pytest.mark.asyncio
+    async def test_empty_text_delta_between_tool_rounds_is_dropped(self, ctx):
+        sc = StreamConverter(ctx)
+        events = []
+
+        async for evt in sc.process_chunk(make_chunk({"content": "First round output"})):
+            events.append(evt)
+
+        sc.prepare_for_next_round()
+
+        async for evt in sc.process_chunk(make_chunk({"role": "assistant", "content": ""})):
+            events.append(evt)
+
+        async for evt in sc.process_chunk(make_chunk({
+            "tool_calls": [{
+                "index": 0,
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": "exec_command", "arguments": '{"cmd":"ls"}'},
+            }]
+        }, finish_reason="tool_calls")):
+            events.append(evt)
+
+        async for evt in sc.finalize():
+            events.append(evt)
+
+        completed = [e[1] for e in events if e[0] == "response.completed"][0]
+        output_types = [item["type"] for item in completed["response"]["output"]]
+        # the empty frame from the second round must not add a message item
+        assert output_types == ["function_call"]
+
+    @pytest.mark.asyncio
+    async def test_empty_reasoning_delta_creates_no_item(self, ctx):
+        sc = StreamConverter(ctx)
+        events = []
+
+        async for evt in sc.process_chunk(make_chunk({"reasoning_content": ""})):
+            events.append(evt)
+
+        async for evt in sc.finalize():
+            events.append(evt)
+
+        event_types = [e[0] for e in events]
+        assert not [t for t in event_types if t.startswith("response.reasoning")]
+        assert "response.output_item.added" not in event_types
+
+        completed = [e[1] for e in events if e[0] == "response.completed"][0]
+        assert completed["response"]["output"] == []
+
+
+class TestReasoningSummaryStreaming:
+    @pytest.mark.asyncio
+    async def test_reasoning_streams_official_summary_events(self, ctx):
+        sc = StreamConverter(ctx)
+        events = []
+
+        async for evt in sc.process_chunk(make_chunk({"reasoning_content": "Let me "})):
+            events.append(evt)
+        async for evt in sc.process_chunk(make_chunk({"reasoning_content": "think."})):
+            events.append(evt)
+        async for evt in sc.process_chunk(make_chunk({"content": "Answer"})):
+            events.append(evt)
+        async for evt in sc.finalize():
+            events.append(evt)
+
+        event_types = [e[0] for e in events]
+        # the non-standard event name is gone
+        assert "response.reasoning.delta" not in event_types
+        assert [t for t in event_types if t.startswith("response.reasoning")] == [
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done",
+        ]
+
+        added = [e[1] for e in events if e[0] == "response.output_item.added"]
+        assert added[0]["item"]["type"] == "reasoning"
+        assert added[0]["item"]["summary"] == []
+
+        part_added = [
+            e[1] for e in events if e[0] == "response.reasoning_summary_part.added"
+        ][0]
+        assert part_added["summary_index"] == 0
+        assert part_added["part"] == {"type": "summary_text", "text": ""}
+
+        deltas = [
+            e[1] for e in events if e[0] == "response.reasoning_summary_text.delta"
+        ]
+        assert [d["delta"] for d in deltas] == ["Let me ", "think."]
+        assert all(d["summary_index"] == 0 for d in deltas)
+
+        text_done = [
+            e[1] for e in events if e[0] == "response.reasoning_summary_text.done"
+        ][0]
+        assert text_done["text"] == "Let me think."
+        part_done = [
+            e[1] for e in events if e[0] == "response.reasoning_summary_part.done"
+        ][0]
+        assert part_done["part"] == {"type": "summary_text", "text": "Let me think."}
+
+        # done events are emitted before output_item.done for the same item
+        assert event_types.index("response.reasoning_summary_text.done") < event_types.index(
+            "response.output_item.done"
+        )
+
+        completed = [e[1] for e in events if e[0] == "response.completed"][0]
+        output = completed["response"]["output"]
+        assert [item["type"] for item in output] == ["reasoning", "message"]
+        assert output[0]["summary"] == [{"type": "summary_text", "text": "Let me think."}]
+        assert output[0]["status"] == "completed"
+        assert output[1]["content"][0]["text"] == "Answer"
+
+        seq_nums = _sequence_numbers(events)
+        assert seq_nums == sorted(seq_nums)
+        assert len(seq_nums) == len(set(seq_nums))

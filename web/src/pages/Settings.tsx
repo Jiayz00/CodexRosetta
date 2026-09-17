@@ -11,14 +11,12 @@ import {
   Terminal,
   ChevronDown,
   Globe,
-  Eye,
-  EyeOff,
-  Key,
   Hash,
   RotateCw,
 } from "lucide-react";
 import { useSettings } from "@/hooks/useSettings";
 import type { SettingsData } from "@/hooks/useSettings";
+import { SearchPoolCard } from "@/components/search/SearchPoolCard";
 
 const LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"];
 
@@ -79,7 +77,6 @@ export function Settings() {
 
   const [saved, setSaved] = useState(false);
   const [logFileInput, setLogFileInput] = useState("");
-  const [showApiKey, setShowApiKey] = useState(false);
 
   useEffect(() => {
     if (settings) {
@@ -100,8 +97,6 @@ export function Settings() {
     (form.WEB_SEARCH_ENABLED !== settings.WEB_SEARCH_ENABLED ||
       form.WEB_SEARCH_PROVIDER !== settings.WEB_SEARCH_PROVIDER ||
       form.WEB_SEARCH_BASE_URL !== settings.WEB_SEARCH_BASE_URL ||
-      (form.WEB_SEARCH_API_KEY !== "***" &&
-        form.WEB_SEARCH_API_KEY !== settings.WEB_SEARCH_API_KEY) ||
       form.WEB_SEARCH_MAX_RESULTS !== settings.WEB_SEARCH_MAX_RESULTS ||
       form.WEB_SEARCH_MAX_ROUNDS !== settings.WEB_SEARCH_MAX_ROUNDS);
 
@@ -119,9 +114,6 @@ export function Settings() {
       updates.WEB_SEARCH_ENABLED = form.WEB_SEARCH_ENABLED;
       updates.WEB_SEARCH_PROVIDER = form.WEB_SEARCH_PROVIDER;
       updates.WEB_SEARCH_BASE_URL = form.WEB_SEARCH_BASE_URL;
-      if (form.WEB_SEARCH_API_KEY !== "***") {
-        updates.WEB_SEARCH_API_KEY = form.WEB_SEARCH_API_KEY;
-      }
       updates.WEB_SEARCH_MAX_RESULTS = form.WEB_SEARCH_MAX_RESULTS;
       updates.WEB_SEARCH_MAX_ROUNDS = form.WEB_SEARCH_MAX_ROUNDS;
     }
@@ -400,7 +392,6 @@ export function Settings() {
                     const newInfo = SEARCH_PROVIDERS.find(x => x.value === newProvider);
                     const updates: Partial<SettingsData> = { WEB_SEARCH_PROVIDER: newProvider };
                     if (newInfo && !newInfo.needsUrl) updates.WEB_SEARCH_BASE_URL = "";
-                    if (newInfo && !newInfo.needsKey) updates.WEB_SEARCH_API_KEY = "";
                     setForm({ ...form, ...updates });
                   }}
                   className={`px-3 py-2 rounded-lg text-xs font-mono border transition-colors ${
@@ -416,52 +407,6 @@ export function Settings() {
               ))}
             </div>
           </div>
-
-          {/* Conditional: API Key */}
-          <AnimatePresence>
-            {providerInfo?.needsKey && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: "auto" }}
-                exit={{ opacity: 0, height: 0 }}
-                className="overflow-hidden"
-              >
-                <div className="px-6 py-4 flex items-center justify-between gap-4">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <Key className="w-4 h-4 text-rosetta-muted flex-shrink-0" />
-              <div className="min-w-0">
-                <p className="text-sm text-rosetta-text">API Key</p>
-                <p className="text-[11px] text-rosetta-muted font-mono truncate">
-                  {providerInfo.keyOptional ? `Optional for ${providerInfo.label}` : `Required for ${providerInfo.label}`}
-                </p>
-              </div>
-                  </div>
-                  <div className="relative w-48">
-                    <input
-                      type={showApiKey ? "text" : "password"}
-                      value={form.WEB_SEARCH_API_KEY}
-                      onChange={(e) =>
-                        setForm({ ...form, WEB_SEARCH_API_KEY: e.target.value })
-                      }
-                      placeholder="Enter API key"
-                      className="w-full px-3 py-1.5 pr-9 rounded-lg rosetta-terminal-input text-xs text-rosetta-text placeholder:text-rosetta-muted/50"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowApiKey(!showApiKey)}
-                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-rosetta-muted hover:text-rosetta-text"
-                    >
-                      {showApiKey ? (
-                        <EyeOff className="w-3.5 h-3.5" />
-                      ) : (
-                        <Eye className="w-3.5 h-3.5" />
-                      )}
-                    </button>
-                  </div>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
 
           {/* Conditional: Base URL */}
           <AnimatePresence>
@@ -564,6 +509,9 @@ export function Settings() {
           </div>
         </div>
       </motion.div>
+
+      {/* Search credential pool */}
+      <SearchPoolCard />
 
       {/* Info footer */}
       <div className="flex items-center gap-2 px-1">

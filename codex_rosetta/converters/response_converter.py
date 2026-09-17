@@ -75,7 +75,7 @@ class ResponseConverter:
         """Convert a Chat Completions assistant message to Responses API output items.
 
         A single assistant message with tool_calls becomes:
-        - One "message" output item (with content)
+        - One "message" output item when the turn has text or a refusal
         - Separate "function_call" output items for each tool call
         """
         items: list[dict[str, Any]] = []
@@ -105,15 +105,19 @@ class ResponseConverter:
             if refusal_part:
                 content_parts.append(refusal_part)
 
-        # Create the message output item (even if content is empty)
-        msg_item: dict[str, Any] = {
-            "type": "message",
-            "id": generate_item_id("message"),
-            "role": "assistant",
-            "status": "completed",
-            "content": content_parts,
-        }
-        items.append(msg_item)
+        # Never announce an empty assistant message: tool-call-only turns carry
+        # no text, and an empty message item makes clients render a spurious
+        # block (it also breaks the Codex client's grouping of consecutive
+        # tool calls into one work block).
+        if content_parts:
+            msg_item: dict[str, Any] = {
+                "type": "message",
+                "id": generate_item_id("message"),
+                "role": "assistant",
+                "status": "completed",
+                "content": content_parts,
+            }
+            items.append(msg_item)
 
         # Create function_call output items
         for tc in tool_calls:

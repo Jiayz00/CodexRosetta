@@ -26,7 +26,9 @@ class StreamConverter:
         context: ConversionContext,
         builtin_registry: BuiltinToolRegistry | None = None,
         auditor: Any = None,
+        defer_builtin_completion: bool = False,
     ) -> None:
+        self._defer_builtin_completion = defer_builtin_completion
         self._context = context
         self._ct = ContentTransformer()
         self._registry = builtin_registry or create_default_registry()
@@ -52,9 +54,11 @@ class StreamConverter:
         is_incomplete = self._state.finish_reason == "length"
         items: list[dict[str, Any]] = []
         for item in self._state.output_items:
-            if item.round_id < self._state.current_round_id:
+            if not self._item_included_in_output(item):
                 continue
             if item.item_type == "message":
+                if not item.accumulated_text:
+                    continue
                 item_status = "incomplete" if is_incomplete else "completed"
                 msg: dict[str, Any] = {
                     "type": "message",
@@ -67,6 +71,8 @@ class StreamConverter:
                     msg["incomplete_details"] = {"reason": "max_output_tokens"}
                 items.append(msg)
             elif item.item_type == "reasoning":
+                if not item.accumulated_text:
+                    continue
                 summary = _build_reasoning_summary(item.accumulated_text)
                 items.append({
                     "type": "reasoning",
@@ -93,12 +99,113 @@ class StreamConverter:
                         args = {}
                     sim = self._registry.get_simulator(original_type)
                     if sim:
-                        fc = sim.convert_to_builtin_output(fc, args)
+                        fc = sim.convert_to_builtin_output(
+                            fc, {**args, "_sources": item.builtin_sources}
+                        )
+                        fc["id"] = item.item_id
                 items.append(fc)
         return items
 
     def next_sequence_number(self) -> int:
         return self._state.next_sequence_number()
+
+    def _item_included_in_output(self, item: OutputItemState) -> bool:
+        """Built-in tool items survive round transitions; chat items do not."""
+        if item.original_tool_type:
+            return True
+        return item.round_id >= self._state.current_round_id
+
+    def round_item_marker(self) -> int:
+        """Index of the first output item created after this call."""
+        return len(self._state.output_items)
+
+    def collect_search_calls(self, marker: int) -> list[dict[str, Any]]:
+        """Fake Chat Completions tool calls for the search items of a round."""
+        calls: list[dict[str, Any]] = []
+        for item in self._state.output_items[marker:]:
+            if item.item_type != "function_call" or not item.original_tool_type:
+                continue
+            calls.append({
+                "id": item.call_id or "",
+                "type": "function",
+                "function": {
+                    "name": item.function_name or "",
+                    "arguments": item.accumulated_arguments or "{}",
+                },
+                "_item_id": item.item_id,
+            })
+        return calls
+
+    def collect_client_tool_calls(self, marker: int) -> list[OutputItemState]:
+        """Client facing tool calls (shell, apply_patch, ...) of a round."""
+        return [
+            item
+            for item in self._state.output_items[marker:]
+            if item.item_type == "function_call" and not item.original_tool_type
+        ]
+
+    def round_assistant_text(self, marker: int) -> str:
+        parts = [
+            item.accumulated_text
+            for item in self._state.output_items[marker:]
+            if item.item_type == "message" and item.accumulated_text
+        ]
+        return "\n".join(parts)
+
+    async def complete_builtin_item(
+        self,
+        item_id: str,
+        sources: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        """Emit completion events for a deferred built-in tool item."""
+        item = next(
+            (i for i in self._state.output_items if i.item_id == item_id), None
+        )
+        if item is None or item.is_closed:
+            return
+        original_type = item.original_tool_type or ""
+        sim = self._registry.get_simulator(original_type)
+        if sim is None:
+            return
+
+        try:
+            args = json.loads(item.accumulated_arguments) if item.accumulated_arguments else {}
+        except json.JSONDecodeError:
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+
+        item.builtin_sources = list(sources or [])
+        args = {**args, "_sources": item.builtin_sources}
+
+        for evt in sim.generate_completion_events(
+            item.item_id, item.call_id or "", item.output_index, args
+        ):
+            yield evt["type"], {
+                **evt["data"],
+                "id": item.item_id,
+                "sequence_number": self._state.next_sequence_number(),
+            }
+
+        final_item = sim.convert_to_builtin_output(
+            {
+                "type": "function_call",
+                "id": item.item_id,
+                "call_id": item.call_id,
+                "name": item.function_name,
+                "arguments": item.accumulated_arguments,
+                "status": "completed",
+            },
+            args,
+        )
+        final_item["id"] = item.item_id
+        yield "response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": item.output_index,
+            "item": final_item,
+            "sequence_number": self._state.next_sequence_number(),
+        }
+        item.is_closed = True
 
     def prepare_for_next_round(self) -> None:
         """Prepare the converter for a new streaming round within the same response.
@@ -195,7 +302,17 @@ class StreamConverter:
     async def _handle_text_delta(
         self, text: str
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-        """Handle a text content delta, emitting appropriate Responses events."""
+        """Handle a text content delta, emitting appropriate Responses events.
+
+        Empty deltas are dropped: upstream chat-completions sends
+        ``{"role": "assistant", "content": ""}`` as the first frame of every
+        round, and materializing a message item for it makes the Codex client
+        render a spurious empty assistant message after each tool call, which
+        breaks its grouping of consecutive commands into one work block.
+        """
+        if not text:
+            return
+
         msg_item = self._state.get_current_message_item()
 
         if msg_item is None:
@@ -244,7 +361,16 @@ class StreamConverter:
     async def _handle_reasoning_delta(
         self, reasoning_text: str
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-        """Handle a reasoning_content delta, mapping to Responses API reasoning item."""
+        """Handle a reasoning_content delta, mapping to a reasoning item.
+
+        The text is exposed through the official reasoning summary event family
+        (``response.reasoning_summary_*``) so clients that only implement the
+        documented Responses API contract can render it; chat-completions
+        providers (GLM, DeepSeek, ...) only send a flat ``reasoning_content``.
+        """
+        if not reasoning_text:
+            return
+
         reasoning_item = self._state.get_current_reasoning_item()
 
         if reasoning_item is None:
@@ -266,15 +392,27 @@ class StreamConverter:
                 "sequence_number": self._state.next_sequence_number(),
             }
 
+        if not reasoning_item.has_content_part_added:
+            reasoning_item.has_content_part_added = True
+            yield "response.reasoning_summary_part.added", {
+                "type": "response.reasoning_summary_part.added",
+                "output_index": reasoning_item.output_index,
+                "item_id": reasoning_item.item_id,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""},
+                "sequence_number": self._state.next_sequence_number(),
+            }
+
         reasoning_delta = {
-            "type": "response.reasoning_text.delta",
+            "type": "response.reasoning_summary_text.delta",
             "output_index": reasoning_item.output_index,
             "item_id": reasoning_item.item_id,
+            "summary_index": 0,
             "delta": reasoning_text,
             "sequence_number": self._state.next_sequence_number(),
         }
-        self._record("response.reasoning_text.delta", reasoning_delta)
-        yield "response.reasoning_text.delta", reasoning_delta
+        self._record("response.reasoning_summary_text.delta", reasoning_delta)
+        yield "response.reasoning_summary_text.delta", reasoning_delta
 
         reasoning_item.accumulated_text += reasoning_text
 
@@ -295,25 +433,48 @@ class StreamConverter:
             self._state.tool_call_index_map[tc_index] = fc_item
 
             # Check for built-in tool mapping
+            simulator = None
             if func_name and is_simulated_function(func_name):
                 original_type = extract_original_type(func_name)
                 fc_item.original_tool_type = original_type
-                sim = self._registry.get_simulator(original_type)
-                if sim:
-                    # Will emit lifecycle events after we have arguments
-                    pass
+                simulator = self._registry.get_simulator(original_type)
+                if simulator is not None:
+                    # Built-in tools keep their own item id (for example
+                    # ws_...) so lifecycle events and the final item share
+                    # one identity.
+                    fc_item.item_id = generate_item_id(original_type)
 
-            yield "response.output_item.added", {
-                "type": "response.output_item.added",
-                "output_index": fc_item.output_index,
-                "item": {
+            if simulator is not None:
+                added_item = simulator.convert_to_builtin_output(
+                    {
+                        "type": "function_call",
+                        "id": fc_item.item_id,
+                        "call_id": call_id,
+                        "name": func_name,
+                        "arguments": "",
+                    },
+                    {},
+                )
+                added_item["id"] = fc_item.item_id
+                added_item["status"] = "in_progress"
+                action = added_item.get("action")
+                if isinstance(action, dict):
+                    action["queries"] = []
+                    action["sources"] = []
+            else:
+                added_item = {
                     "type": "function_call",
                     "id": fc_item.item_id,
                     "call_id": call_id,
                     "name": func_name,
                     "arguments": "",
                     "status": "in_progress",
-                },
+                }
+
+            yield "response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": fc_item.output_index,
+                "item": added_item,
                 "sequence_number": self._state.next_sequence_number(),
             }
 
@@ -338,6 +499,7 @@ class StreamConverter:
                     for evt in lifecycle_events:
                         yield evt["type"], {
                             **evt["data"],
+                            "id": fc_item.item_id,
                             "sequence_number": self._state.next_sequence_number(),
                         }
 
@@ -382,25 +544,45 @@ class StreamConverter:
             "sequence_number": self._state.next_sequence_number(),
         }
 
-    async def finalize(self) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-        """Emit finalization events for all open items and the completed response."""
+    async def finalize_round(self) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        """Finalize the items created in the current round (done events).
+
+        Deferred built-in tool items are skipped: the router completes them
+        after the real tool call ran, so status and sources are accurate.
+        """
         for item in self._state.output_items:
             if item.is_closed:
                 continue
+            if item.round_id != self._state.current_round_id:
+                continue
+            if self._defer_builtin_completion and item.original_tool_type:
+                continue
 
-            if item.item_type == "message":
-                async for evt in self._finalize_message_item(item):
-                    yield evt
-
-            elif item.item_type == "reasoning":
-                async for evt in self._finalize_reasoning_item(item):
-                    yield evt
-
-            elif item.item_type == "function_call":
-                async for evt in self._finalize_function_call_item(item):
-                    yield evt
+            async for evt in self._finalize_item(item):
+                yield evt
 
             item.is_closed = True
+
+    async def _finalize_item(
+        self, item: OutputItemState
+    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        """Emit the done events for a single output item."""
+        if item.item_type == "message":
+            async for evt in self._finalize_message_item(item):
+                yield evt
+
+        elif item.item_type == "reasoning":
+            async for evt in self._finalize_reasoning_item(item):
+                yield evt
+
+        elif item.item_type == "function_call":
+            async for evt in self._finalize_function_call_item(item):
+                yield evt
+
+    async def finalize(self) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        """Finalize remaining items and emit the completed response."""
+        async for evt in self.finalize_round():
+            yield evt
 
         # Build and emit response.completed
         completed_at = unix_timestamp()
@@ -417,7 +599,15 @@ class StreamConverter:
     async def _finalize_message_item(
         self, item: OutputItemState
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-        """Emit done events for a message output item."""
+        """Emit done events for a message output item.
+
+        Message items only carry non-empty text, so an item without text (for
+        example a refusal-only turn) is dropped instead of being announced as
+        an empty assistant message.
+        """
+        if not item.accumulated_text:
+            return
+
         if item.has_content_part_added:
             yield "response.output_text.done", {
                 "type": "response.output_text.done",
@@ -466,25 +656,51 @@ class StreamConverter:
         self, item: OutputItemState
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         """Emit done events for a reasoning output item."""
-        if item.has_item_added:
-            summary = _build_reasoning_summary(item.accumulated_text)
-            yield "response.output_item.done", {
-                "type": "response.output_item.done",
+        if not item.has_item_added or not item.accumulated_text:
+            # Reasoning items are only created for non-empty deltas; this guard
+            # keeps empty items out of the stream and the final response.
+            return
+
+        if item.has_content_part_added:
+            yield "response.reasoning_summary_text.done", {
+                "type": "response.reasoning_summary_text.done",
                 "output_index": item.output_index,
-                "item": {
-                    "type": "reasoning",
-                    "id": item.item_id,
-                    "summary": summary,
-                    "encrypted_content": None,
-                    "status": "completed",
-                },
+                "item_id": item.item_id,
+                "summary_index": 0,
+                "text": item.accumulated_text,
                 "sequence_number": self._state.next_sequence_number(),
             }
+
+            yield "response.reasoning_summary_part.done", {
+                "type": "response.reasoning_summary_part.done",
+                "output_index": item.output_index,
+                "item_id": item.item_id,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": item.accumulated_text},
+                "sequence_number": self._state.next_sequence_number(),
+            }
+
+        yield "response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": item.output_index,
+            "item": {
+                "type": "reasoning",
+                "id": item.item_id,
+                "summary": _build_reasoning_summary(item.accumulated_text),
+                "encrypted_content": None,
+                "status": "completed",
+            },
+            "sequence_number": self._state.next_sequence_number(),
+        }
 
     async def _finalize_function_call_item(
         self, item: OutputItemState
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         """Emit done events for a function_call output item."""
+        if self._defer_builtin_completion and item.original_tool_type:
+            # The router completes these items after the real search ran so
+            # status and sources are accurate.
+            return
         yield "response.function_call_arguments.done", {
             "type": "response.function_call_arguments.done",
             "output_index": item.output_index,
@@ -553,9 +769,11 @@ class StreamConverter:
         """Build the full Response object for the completed event."""
         output: list[dict[str, Any]] = []
         for item in self._state.output_items:
-            if item.round_id < self._state.current_round_id:
+            if not self._item_included_in_output(item):
                 continue
             if item.item_type == "message":
+                if not item.accumulated_text:
+                    continue
                 output.append({
                     "type": "message",
                     "id": item.item_id,
@@ -566,6 +784,8 @@ class StreamConverter:
                     ],
                 })
             elif item.item_type == "reasoning":
+                if not item.accumulated_text:
+                    continue
                 summary = _build_reasoning_summary(item.accumulated_text)
                 output.append({
                     "type": "reasoning",
@@ -592,7 +812,10 @@ class StreamConverter:
                         args = {}
                     sim = self._registry.get_simulator(original_type)
                     if sim:
-                        fc = sim.convert_to_builtin_output(fc, args)
+                        fc = sim.convert_to_builtin_output(
+                            fc, {**args, "_sources": item.builtin_sources}
+                        )
+                        fc["id"] = item.item_id
                 output.append(fc)
 
         usage = self._convert_usage()

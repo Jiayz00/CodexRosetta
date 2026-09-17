@@ -43,10 +43,34 @@ class UpstreamClient:
         headers.update(self._adapter.get_auth_headers(self._settings.UPSTREAM_API_KEY))
         return headers
 
+    @staticmethod
+    def _finalize_request(
+        adapted: dict[str, Any], headers: dict[str, str]
+    ) -> dict[str, Any]:
+        """Move `prompt_cache_key` out of the body and into a `session_id` header.
+
+        The Responses API field is a cache-routing hint for chat-completions
+        gateways (sub2api derives its sticky session seed from it), but many
+        strict chat-completions upstreams reject the field outright with
+        ``400 未知请求字段：prompt_cache_key``. Moving the value into the
+        ``session_id`` header keeps the same sticky/cache identity for the
+        gateway while the wire body stays within the chat-completions schema.
+        """
+        if "prompt_cache_key" not in adapted:
+            return adapted
+
+        body = dict(adapted)
+        cache_key = str(body.pop("prompt_cache_key") or "").strip()
+        if cache_key:
+            headers.setdefault("session_id", cache_key)
+        return body
+
     async def chat_completions(self, request_body: dict[str, Any]) -> dict[str, Any]:
         """Send a non-streaming request to upstream /v1/chat/completions."""
-        adapted = self._adapter.adapt_request(request_body)
         headers = self._get_headers()
+        adapted = self._finalize_request(
+            self._adapter.adapt_request(request_body), headers
+        )
 
         self._log.info(
             "upstream_request_sent",
@@ -94,8 +118,10 @@ class UpstreamClient:
         self, request_body: dict[str, Any]
     ) -> AsyncIterator[bytes]:
         """Stream from upstream /v1/chat/completions."""
-        adapted = self._adapter.adapt_request(request_body)
         headers = self._get_headers()
+        adapted = self._finalize_request(
+            self._adapter.adapt_request(request_body), headers
+        )
 
         self._log.info(
             "upstream_stream_started",

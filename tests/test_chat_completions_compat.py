@@ -163,14 +163,19 @@ class TestReasoningRoundTrip:
 
         assert messages[0]["reasoning_content"] == "summarised\nraw"
 
-    def test_reasoning_without_text_is_ignored(self, input_transformer):
+    def test_reasoning_without_text_gets_placeholder(self, input_transformer):
+        """Thinking-mode upstreams still require a value on tool-call turns."""
+        from codex_rosetta.converters.input_transformer import (
+            MISSING_REASONING_PLACEHOLDER,
+        )
+
         messages = input_transformer.transform_input([
             {"type": "reasoning", "summary": [], "encrypted_content": "abc"},
             {"type": "function_call", "name": "ping", "call_id": "c", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "c", "output": "pong"},
         ])
 
-        assert "reasoning_content" not in messages[0]
+        assert messages[0]["reasoning_content"] == MISSING_REASONING_PLACEHOLDER
 
     def test_stale_reasoning_does_not_leak_into_later_turn(self, input_transformer):
         messages = input_transformer.transform_input([
@@ -298,7 +303,7 @@ class TestReasoningStreamEventName:
             if event_data is not None:
                 names.append(event_type)
 
-        assert "response.reasoning_text.delta" in names
+        assert "response.reasoning_summary_text.delta" in names
         assert "response.reasoning.delta" not in names
 
     @pytest.mark.asyncio

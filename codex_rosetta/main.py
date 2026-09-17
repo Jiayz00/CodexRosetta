@@ -78,11 +78,13 @@ def create_app() -> FastAPI:
     from codex_rosetta.api.router import router
     from codex_rosetta.api.keys_router import router as keys_router
     from codex_rosetta.api.settings_router import router as settings_router
+    from codex_rosetta.api.search_pool_router import router as search_pool_router
     from codex_rosetta.api.web_router import mount_webui
 
     app.include_router(router)
     app.include_router(keys_router)
     app.include_router(settings_router)
+    app.include_router(search_pool_router)
 
     mount_webui(app)
 

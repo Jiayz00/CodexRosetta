@@ -5,6 +5,11 @@ from typing import Any
 
 from codex_rosetta.converters.content_transformer import ContentTransformer
 
+# Placeholder used when a tool-call turn has no upstream reasoning text to
+# replay; see InputTransformer._flush_assistant. Kept constant so the
+# replayed history stays byte-stable across turns (prompt-cache friendly).
+MISSING_REASONING_PLACEHOLDER = "(reasoning unavailable)"
+
 
 class InputTransformer:
     """Convert Responses API input array to Chat Completions messages array."""
@@ -48,7 +53,7 @@ class InputTransformer:
         messages: list[dict[str, Any]] = []
         pending_assistant: dict[str, Any] | None = None
         pending_tool_calls: list[dict[str, Any]] = []
-        pending_reasoning = ""
+        pending_reasoning: str = ""
 
         for item in items:
             if not isinstance(item, dict):
@@ -73,9 +78,11 @@ class InputTransformer:
                         )
                         pending_assistant = None
                         pending_tool_calls = []
-                    # Reasoning that never reached an assistant turn must
-                    # not leak into a later one.
-                    pending_reasoning = ""
+                        pending_reasoning = ""
+                    else:
+                        # A reasoning item with no assistant output to attach
+                        # to must not leak into a later turn.
+                        pending_reasoning = ""
 
                     mapped_role = "system" if role == "developer" else role
                     converted_content = self._ct.responses_input_to_chat_content(content)
@@ -108,10 +115,11 @@ class InputTransformer:
                     pending_assistant = {"role": "assistant", "content": converted_content}
 
             elif item_type == "function_call":
+                # Codex may replay tool calls without a preceding assistant
+                # message item. Create one, otherwise the tool calls are
+                # dropped and the following `tool` message is orphaned,
+                # which upstream APIs reject.
                 if pending_assistant is None:
-                    # A tool call can arrive without a preceding assistant
-                    # message item. Without one, the following `tool`
-                    # message would be orphaned and rejected upstream.
                     pending_assistant = {"role": "assistant", "content": None}
                 tc: dict[str, Any] = {
                     "id": item.get("call_id", item.get("id", "")),
@@ -149,9 +157,6 @@ class InputTransformer:
             elif item_type == "custom_tool_call":
                 if pending_assistant is None:
                     pending_assistant = {"role": "assistant", "content": None}
-                # Custom tools are advertised to the upstream as functions
-                # (see ToolTransformer._convert_custom_tool), so the
-                # historical tool call has to use the same shape.
                 tc: dict[str, Any] = {
                     "id": item.get("call_id", item.get("id", "")),
                     "type": "function",
@@ -228,21 +233,33 @@ class InputTransformer:
         tool_calls: list[dict[str, Any]],
         reasoning_content: str = "",
     ) -> None:
+        """Emit a pending assistant message in Chat Completions shape.
+
+        Thinking-mode upstreams (DeepSeek et al.) reject a history where an
+        assistant message carries `tool_calls` but no `reasoning_content`:
+        ``400 The `reasoning_content` in the thinking mode must be passed back
+        to the API``. Not every upstream streams reasoning, so some turns have
+        none to replay; a fixed placeholder keeps the history acceptable. The
+        placeholder only satisfies that protocol check -- it is not part of the
+        model-visible context and is not billed.
+        """
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
             if assistant_msg.get("content") == "" or assistant_msg.get("content") is None:
                 assistant_msg["content"] = None
         if reasoning_content:
             assistant_msg["reasoning_content"] = reasoning_content
+        elif tool_calls:
+            assistant_msg["reasoning_content"] = MISSING_REASONING_PLACEHOLDER
         if not tool_calls and not assistant_msg.get("content"):
-            # Nothing to say and no tool call to make. Emitting it would sit
+            # Nothing to say and no tool call to make: emitting it would sit
             # between a tool_calls message and its tool result.
             return
         messages.append(assistant_msg)
 
 
 def _extract_reasoning_text(item: dict[str, Any]) -> str:
-    """Collect the plain text carried by a Responses API ``reasoning`` item."""
+    """Collect the plain text carried by a Responses API `reasoning` item."""
     parts: list[str] = []
     for field in ("summary", "content"):
         entries = item.get(field)
