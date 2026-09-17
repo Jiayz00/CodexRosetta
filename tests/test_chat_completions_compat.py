@@ -116,15 +116,15 @@ class TestReasoningRoundTrip:
                     "summary": [{"type": "summary_text", "text": "I should call ping."}],
                     "encrypted_content": None,
                 },
-                {"type": "function_call", "name": "ping", "call_id": "call_1", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": "call_1", "output": "pong"},
+                {"type": "function_call", "name": "ping", "call_id": "call_1000000000000000000000000", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1000000000000000000000000", "output": "pong"},
             ],
             instructions="You are Codex.",
         )
 
         assert [m["role"] for m in messages] == ["system", "user", "assistant", "tool"]
         assert messages[2]["reasoning_content"] == "I should call ping."
-        assert messages[2]["tool_calls"][0]["id"] == "call_1"
+        assert messages[2]["tool_calls"][0]["id"] == "call_1000000000000000000000000"
         assert messages[3]["content"] == "pong"
 
     def test_reasoning_attaches_to_plain_assistant_turn(self, input_transformer):
@@ -143,8 +143,8 @@ class TestReasoningRoundTrip:
         messages = input_transformer.transform_input([
             {"type": "reasoning", "summary": [{"type": "summary_text", "text": "first"}]},
             {"type": "reasoning", "summary": [{"type": "summary_text", "text": "second"}]},
-            {"type": "function_call", "name": "ping", "call_id": "c", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "c", "output": "pong"},
+            {"type": "function_call", "name": "ping", "call_id": "call_c000000000000000000000001", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_c000000000000000000000001", "output": "pong"},
         ])
 
         assert messages[0]["reasoning_content"] == "first\nsecond"
@@ -157,8 +157,8 @@ class TestReasoningRoundTrip:
                 "summary": [{"type": "summary_text", "text": "summarised"}],
                 "content": [{"type": "reasoning_text", "text": "raw"}],
             },
-            {"type": "function_call", "name": "ping", "call_id": "c", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "c", "output": "pong"},
+            {"type": "function_call", "name": "ping", "call_id": "call_c000000000000000000000001", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_c000000000000000000000001", "output": "pong"},
         ])
 
         assert messages[0]["reasoning_content"] == "summarised\nraw"
@@ -171,8 +171,8 @@ class TestReasoningRoundTrip:
 
         messages = input_transformer.transform_input([
             {"type": "reasoning", "summary": [], "encrypted_content": "abc"},
-            {"type": "function_call", "name": "ping", "call_id": "c", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "c", "output": "pong"},
+            {"type": "function_call", "name": "ping", "call_id": "call_c000000000000000000000001", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_c000000000000000000000001", "output": "pong"},
         ])
 
         assert messages[0]["reasoning_content"] == MISSING_REASONING_PLACEHOLDER
@@ -201,14 +201,14 @@ class TestToolCallOrdering:
     def test_empty_assistant_placeholder_is_dropped(self, input_transformer):
         messages = input_transformer.transform_input([
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run it"}]},
-            {"type": "function_call", "name": "shell", "call_id": "call_1", "arguments": "{}"},
+            {"type": "function_call", "name": "shell", "call_id": "call_1000000000000000000000000", "arguments": "{}"},
             {"type": "message", "role": "assistant", "content": []},
-            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+            {"type": "function_call_output", "call_id": "call_1000000000000000000000000", "output": "ok"},
         ])
 
         assert [m["role"] for m in messages] == ["user", "assistant", "tool"]
-        assert messages[1]["tool_calls"][0]["id"] == "call_1"
-        assert messages[2]["tool_call_id"] == "call_1"
+        assert messages[1]["tool_calls"][0]["id"] == messages[2]["tool_call_id"]
+        assert messages[2]["tool_call_id"] == "call_1000000000000000000000000"
 
     def test_empty_string_content_assistant_is_dropped(self, input_transformer):
         messages = input_transformer.transform_input([
@@ -221,16 +221,19 @@ class TestToolCallOrdering:
 
     def test_parallel_calls_stay_on_one_assistant_message(self, input_transformer):
         messages = input_transformer.transform_input([
-            {"type": "function_call", "name": "a", "call_id": "c1", "arguments": "{}"},
+            {"type": "function_call", "name": "a", "call_id": "call_c100000000000000000000000", "arguments": "{}"},
             {"type": "message", "role": "assistant", "content": []},
-            {"type": "function_call", "name": "b", "call_id": "c2", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "c1", "output": "1"},
-            {"type": "function_call_output", "call_id": "c2", "output": "2"},
+            {"type": "function_call", "name": "b", "call_id": "call_c200000000000000000000000", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_c100000000000000000000000", "output": "1"},
+            {"type": "function_call_output", "call_id": "call_c200000000000000000000000", "output": "2"},
         ])
 
         assert [m["role"] for m in messages] == ["assistant", "tool", "tool"]
-        assert [tc["id"] for tc in messages[0]["tool_calls"]] == ["c1", "c2"]
-        assert [m["tool_call_id"] for m in messages[1:]] == ["c1", "c2"]
+        assert [tc["id"] for tc in messages[0]["tool_calls"]] == ['call_c100000000000000000000000', 'call_c200000000000000000000000']
+        assert [m["tool_call_id"] for m in messages[1:]] == [
+            "call_c100000000000000000000000",
+            "call_c200000000000000000000000",
+        ]
 
     def test_tool_call_without_assistant_message_gets_one(self, input_transformer):
         messages = input_transformer.transform_input([
@@ -242,21 +245,23 @@ class TestToolCallOrdering:
         assert messages[0]["role"] == "assistant"
         assert messages[0]["content"] is None
         assert messages[0]["tool_calls"][0]["function"]["name"] == "shell"
-        assert messages[1] == {"role": "tool", "tool_call_id": "call_9", "content": "ok"}
+        assert messages[1]["role"] == "tool"
+        assert messages[1]["content"] == "ok"
+        assert messages[1]["tool_call_id"] == messages[0]["tool_calls"][0]["id"]
 
     def test_assistant_text_kept_alongside_tool_calls(self, input_transformer):
         messages = input_transformer.transform_input([
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run it"}]},
             {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Let me check."}]},
-            {"type": "function_call", "name": "shell", "call_id": "call_t", "arguments": "{}"},
+            {"type": "function_call", "name": "shell", "call_id": "call_t000000000000000000000000", "arguments": "{}"},
             {"type": "message", "role": "assistant", "content": []},
-            {"type": "function_call_output", "call_id": "call_t", "output": "ok"},
+            {"type": "function_call_output", "call_id": "call_t000000000000000000000000", "output": "ok"},
         ])
 
         assert [m["role"] for m in messages] == ["user", "assistant", "tool"]
         assert messages[1]["content"] == "Let me check."
-        assert messages[1]["tool_calls"][0]["id"] == "call_t"
-        assert messages[2]["tool_call_id"] == "call_t"
+        assert messages[1]["tool_calls"][0]["id"] == "call_t000000000000000000000000"
+        assert messages[2]["tool_call_id"] == "call_t000000000000000000000000"
 
 
 class TestCustomToolCalls:
@@ -265,8 +270,8 @@ class TestCustomToolCalls:
 
     def test_custom_tool_call_uses_function_shape(self, input_transformer):
         messages = input_transformer.transform_input([
-            {"type": "custom_tool_call", "name": "apply_patch", "call_id": "call_c", "input": "patch"},
-            {"type": "custom_tool_call_output", "call_id": "call_c", "output": "applied"},
+            {"type": "custom_tool_call", "name": "apply_patch", "call_id": "call_c000000000000000000000000", "input": "patch"},
+            {"type": "custom_tool_call_output", "call_id": "call_c000000000000000000000000", "output": "applied"},
         ])
 
         assert messages[0]["role"] == "assistant"
@@ -275,7 +280,7 @@ class TestCustomToolCalls:
         assert tool_call["function"]["name"] == "apply_patch"
         assert json.loads(tool_call["function"]["arguments"]) == {"input": "patch"}
         assert messages[1]["role"] == "tool"
-        assert messages[1]["tool_call_id"] == "call_c"
+        assert messages[1]["tool_call_id"] == "call_c000000000000000000000000"
 
 
 class TestReasoningStreamEventName:

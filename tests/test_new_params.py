@@ -69,7 +69,8 @@ class TestInclude:
         assert "reasoning.encrypted_content" in ctx.include_fields
         assert "message.output_text.logprobs" in ctx.include_fields
 
-    def test_include_reasoning_placeholder_injected(self):
+    def test_include_reasoning_does_not_fabricate_item(self):
+        """include=reasoning.encrypted_content must not invent an empty reasoning item."""
         rc = ResponseConverter(ContentTransformer())
         ctx = ConversionContext(
             response_id="resp_test",
@@ -85,6 +86,33 @@ class TestInclude:
                 "index": 0,
                 "finish_reason": "stop",
                 "message": {"role": "assistant", "content": "Hello"},
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+        result = rc.convert(chat_resp, ctx)
+        reasoning_items = [o for o in result["output"] if o.get("type") == "reasoning"]
+        assert reasoning_items == []
+
+    def test_real_reasoning_item_keeps_encrypted_content_field(self):
+        rc = ResponseConverter(ContentTransformer())
+        ctx = ConversionContext(
+            response_id="resp_test",
+            model="gpt-4o",
+            include_fields=["reasoning.encrypted_content"],
+        )
+        chat_resp = {
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1746000000,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello",
+                    "reasoning_content": "thinking...",
+                },
             }],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         }

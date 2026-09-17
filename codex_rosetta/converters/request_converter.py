@@ -9,8 +9,84 @@ from codex_rosetta.converters.input_transformer import (
     sanitize_tool_call_messages,
 )
 from codex_rosetta.converters.tool_transformer import ToolTransformer
-from codex_rosetta.models.common import ConversionContext, is_simulated_function
+from codex_rosetta.models.common import ConversionContext, UnsupportedParameterError
 from codex_rosetta.utils.id_generation import generate_response_id
+from codex_rosetta.utils.logging import get_logger
+
+logger = get_logger("request_converter")
+
+# Responses API fields that map onto a Chat Completions field (handled explicitly below).
+_MAPPED_FIELDS = frozenset({
+    "model",
+    "input",
+    "instructions",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "metadata",
+    "service_tier",
+    "store",
+    "stream",
+    "temperature",
+    "top_p",
+    "top_logprobs",
+    "logprobs",
+    "user",
+    "safety_identifier",
+    "prompt_cache_key",
+    "reasoning",
+    "text",
+    # Chat Completions native sampling knobs some clients send next to Responses params.
+    "seed",
+    "stop",
+    "frequency_penalty",
+    "presence_penalty",
+})
+
+# Handled inside the gateway; must never leak into the Chat Completions body.
+_LOCAL_FIELDS = frozenset({
+    "max_output_tokens",
+    "max_tool_calls",
+    "truncation",
+    "include",
+    "stream_options",
+    "previous_response_id",
+    "conversation",
+})
+
+# Accepted and understood, but with no Chat Completions equivalent — dropped with a log.
+_IGNORED_FIELDS = frozenset({
+    "client_metadata",
+    "background",
+    "moderation",
+    "prompt_cache_retention",
+    "prompt_cache_options",
+})
+
+# Responses-only capabilities that need a server-side state machine this gateway
+# does not have. Failing fast beats pretending to honour them.
+_REJECTED_FIELDS = frozenset({
+    "context_management",
+    "prompt",
+    "modalities",
+    "audio",
+})
+
+_KNOWN_FIELDS = _MAPPED_FIELDS | _LOCAL_FIELDS | _IGNORED_FIELDS | _REJECTED_FIELDS
+
+_ALLOWED_INCLUDE = frozenset({
+    "file_search_call.results",
+    "web_search_call.results",
+    "web_search_call.action.sources",
+    "message.input_image.image_url",
+    "computer_call_output.output.image_url",
+    "code_interpreter_call.outputs",
+    "reasoning.encrypted_content",
+    "message.output_text.logprobs",
+})
+
+_ALLOWED_REASONING_KEYS = frozenset({"effort", "summary", "generate_summary"})
+_ALLOWED_TEXT_KEYS = frozenset({"format", "verbosity"})
 
 
 class RequestConverter:
@@ -31,11 +107,18 @@ class RequestConverter:
 
         Returns:
             Tuple of (chat_completions_request_body, conversion_context)
+
+        Raises:
+            UnsupportedParameterError: when a Responses field cannot be mapped,
+                is handled locally, or is explicitly not supported.
         """
+        self._validate_request(responses_request)
+
         context = ConversionContext(
             response_id=generate_response_id(),
             model=responses_request.get("model", ""),
             original_instructions=responses_request.get("instructions"),
+            original_request=dict(responses_request),
         )
 
         chat_request: dict[str, Any] = {}
@@ -73,46 +156,31 @@ class RequestConverter:
                 tool_choice, context
             )
 
-        # Parameter mappings
-        self._map_parameters(responses_request, chat_request)
-
-        # text.verbosity — append hint to system message
-        text_config = responses_request.get("text")
-        if text_config and isinstance(text_config, dict):
-            verbosity = text_config.get("verbosity")
-            if verbosity:
-                self._apply_verbosity(messages, verbosity)
-
-        # include — record for null placeholder injection in response
-        include = responses_request.get("include")
-        if include and isinstance(include, list):
-            context.include_fields = include
-
-        # max_tool_calls — record for truncation in response
-        max_tool_calls = responses_request.get("max_tool_calls")
-        if max_tool_calls is not None:
-            context.max_tool_calls = max_tool_calls
-
-        # truncation — record for retry-on-context-overflow
-        truncation = responses_request.get("truncation")
-        if truncation:
-            context.truncation = truncation
+        # max_output_tokens -> max_completion_tokens
+        max_output = responses_request.get("max_output_tokens")
+        if max_output is not None:
+            chat_request["max_completion_tokens"] = max_output
 
         # Stream
-        is_streaming = responses_request.get("stream", False)
+        is_streaming = bool(responses_request.get("stream", False))
         chat_request["stream"] = is_streaming
         context.had_streaming = is_streaming
 
         if is_streaming:
-            stream_options = responses_request.get("stream_options")
-            if stream_options:
-                chat_request["stream_options"] = stream_options
-            else:
-                chat_request["stream_options"] = {"include_usage": True}
+            # Chat Completions only understands include_usage; include_obfuscation
+            # is a Responses-only key that makes strict upstreams 400.
+            stream_options = responses_request.get("stream_options") or {}
+            if not isinstance(stream_options, dict):
+                raise UnsupportedParameterError(
+                    "stream_options", "stream_options must be an object."
+                )
+            chat_request["stream_options"] = {
+                "include_usage": bool(stream_options.get("include_usage", True)),
+            }
 
-        # Text format -> response_format
+        # text.format -> response_format, text.verbosity -> system hint
         text_config = responses_request.get("text")
-        if text_config and isinstance(text_config, dict):
+        if isinstance(text_config, dict):
             context.original_text_format = text_config
             fmt = text_config.get("format")
             if fmt:
@@ -128,14 +196,18 @@ class RequestConverter:
                 else:
                     chat_request["response_format"] = fmt
 
-        # Reasoning -> reasoning_effort
+            verbosity = text_config.get("verbosity")
+            if verbosity:
+                self._apply_verbosity(messages, verbosity)
+
+        # reasoning.effort -> reasoning_effort
         reasoning = responses_request.get("reasoning")
-        if reasoning and isinstance(reasoning, dict):
+        if isinstance(reasoning, dict):
             effort = reasoning.get("effort")
             if effort:
                 chat_request["reasoning_effort"] = effort
 
-        # Pass-through fields
+        # Pass-through fields that exist in Chat Completions
         for field in (
             "temperature",
             "top_p",
@@ -157,6 +229,25 @@ class RequestConverter:
             if value is not None:
                 chat_request[field] = value
 
+        # Chat Completions requires logprobs=true for top_logprobs to be honoured.
+        if chat_request.get("top_logprobs") and not chat_request.get("logprobs"):
+            chat_request["logprobs"] = True
+
+        # include — recorded; used to decide which optional output parts to emit
+        include = responses_request.get("include")
+        if isinstance(include, list):
+            context.include_fields = include
+
+        # max_tool_calls — record for truncation in response
+        max_tool_calls = responses_request.get("max_tool_calls")
+        if max_tool_calls is not None:
+            context.max_tool_calls = max_tool_calls
+
+        # truncation — record for retry-on-context-overflow
+        truncation = responses_request.get("truncation")
+        if truncation:
+            context.truncation = truncation
+
         # Sanitize messages — fix broken tool_call arguments
         self._sanitize_messages(messages)
 
@@ -166,16 +257,58 @@ class RequestConverter:
 
         return chat_request, context
 
-    def _map_parameters(
-        self,
-        responses_request: dict[str, Any],
-        chat_request: dict[str, Any],
-    ) -> None:
-        """Map parameter names between APIs."""
-        # max_output_tokens -> max_completion_tokens
-        max_output = responses_request.get("max_output_tokens")
-        if max_output is not None:
-            chat_request["max_completion_tokens"] = max_output
+    @staticmethod
+    def _validate_request(body: dict[str, Any]) -> None:
+        """Classify every top-level field as mapped / local / ignored / rejected.
+
+        Anything that does not fall into one of those buckets is refused so that
+        Responses-only fields never silently reach the Chat Completions upstream.
+        """
+        for key, value in body.items():
+            if value is None:
+                continue
+            if key not in _KNOWN_FIELDS:
+                raise UnsupportedParameterError(
+                    key, f"Unsupported parameter: '{key}'."
+                )
+            if key in _REJECTED_FIELDS:
+                raise UnsupportedParameterError(
+                    key, f"Parameter '{key}' is not supported by this gateway."
+                )
+            if key in _IGNORED_FIELDS:
+                logger.info("request_field_ignored", field=key)
+
+        if body.get("background") is True:
+            raise UnsupportedParameterError(
+                "background", "Parameter 'background=true' is not supported."
+            )
+
+        include = body.get("include")
+        if include is not None:
+            if not isinstance(include, list):
+                raise UnsupportedParameterError("include", "include must be an array.")
+            for value in include:
+                if value not in _ALLOWED_INCLUDE:
+                    raise UnsupportedParameterError(
+                        "include", f"Unsupported include value: '{value}'."
+                    )
+
+        reasoning = body.get("reasoning")
+        if isinstance(reasoning, dict):
+            for key in reasoning:
+                if key not in _ALLOWED_REASONING_KEYS:
+                    raise UnsupportedParameterError(
+                        f"reasoning.{key}",
+                        f"Unsupported reasoning parameter: '{key}'.",
+                    )
+
+        text_config = body.get("text")
+        if isinstance(text_config, dict):
+            for key in text_config:
+                if key not in _ALLOWED_TEXT_KEYS:
+                    raise UnsupportedParameterError(
+                        f"text.{key}", f"Unsupported text parameter: '{key}'."
+                    )
 
     def _apply_verbosity(
         self, messages: list[dict[str, Any]], verbosity: str

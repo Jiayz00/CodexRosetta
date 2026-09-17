@@ -73,7 +73,7 @@ class TestFunctionCallGrouping:
         result = tf.transform_input([
             {"type": "message", "role": "user", "content": "Weather in SF?"},
             {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Let me check."}]},
-            {"type": "function_call", "name": "get_weather", "call_id": "call_abc", "arguments": '{"location":"SF"}'},
+            {"type": "function_call", "name": "get_weather", "call_id": "call_abc000000000000000000000000", "arguments": '{"location":"SF"}'},
         ])
         # The unanswered call cannot be sent to Chat Completions, but the
         # assistant text is preserved.
@@ -123,34 +123,34 @@ class TestFunctionCallGrouping:
     @pytest.mark.asyncio
     async def test_partial_tool_results_remove_only_orphan_tool_call(self, tf):
         result = tf.transform_input([
-            {"type": "function_call", "name": "first", "call_id": "call_1", "arguments": "{}"},
-            {"type": "function_call", "name": "second", "call_id": "call_2", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+            {"type": "function_call", "name": "first", "call_id": "call_1000000000000000000000000", "arguments": "{}"},
+            {"type": "function_call", "name": "second", "call_id": "call_2111111111111111111111111", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1000000000000000000000000", "output": "ok"},
         ])
         assert len(result) == 2
-        assert [tc["id"] for tc in result[0]["tool_calls"]] == ["call_1"]
-        assert result[1]["tool_call_id"] == "call_1"
+        assert [tc["id"] for tc in result[0]["tool_calls"]] == ["call_1000000000000000000000000"]
+        assert result[1]["tool_call_id"] == "call_1000000000000000000000000"
 
     @pytest.mark.asyncio
     async def test_function_call_output(self, tf):
         result = tf.transform_input([
             {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Let me check."}]},
-            {"type": "function_call", "name": "get_weather", "call_id": "call_abc", "arguments": '{"location":"SF"}'},
-            {"type": "function_call_output", "call_id": "call_abc", "output": '{"temp":72}'},
+            {"type": "function_call", "name": "get_weather", "call_id": "call_abc000000000000000000000000", "arguments": '{"location":"SF"}'},
+            {"type": "function_call_output", "call_id": "call_abc000000000000000000000000", "output": '{"temp":72}'},
         ])
         # assistant msg + tool msg
         assert len(result) == 2
         assert result[0]["role"] == "assistant"
-        assert result[0]["tool_calls"][0]["id"] == "call_abc"
+        assert result[0]["tool_calls"][0]["id"] == "call_abc000000000000000000000000"
         assert result[1]["role"] == "tool"
-        assert result[1]["tool_call_id"] == "call_abc"
+        assert result[1]["tool_call_id"] == "call_abc000000000000000000000000"
         assert result[1]["content"] == '{"temp":72}'
 
     @pytest.mark.asyncio
     async def test_assistant_with_null_content_and_tool_calls(self, tf):
         result = tf.transform_input([
             {"type": "message", "role": "assistant", "content": None},
-            {"type": "function_call", "name": "get_weather", "call_id": "call_1", "arguments": '{}'},
+            {"type": "function_call", "name": "get_weather", "call_id": "call_1000000000000000000000000", "arguments": '{}'},
         ])
         assert result == []
 
@@ -158,8 +158,8 @@ class TestFunctionCallGrouping:
     async def test_parallel_tool_calls(self, tf):
         result = tf.transform_input([
             {"type": "message", "role": "assistant", "content": None},
-            {"type": "function_call", "name": "get_weather", "call_id": "call_1", "arguments": '{"location":"SF"}'},
-            {"type": "function_call", "name": "get_weather", "call_id": "call_2", "arguments": '{"location":"NYC"}'},
+            {"type": "function_call", "name": "get_weather", "call_id": "call_1000000000000000000000000", "arguments": '{"location":"SF"}'},
+            {"type": "function_call", "name": "get_weather", "call_id": "call_2111111111111111111111111", "arguments": '{"location":"NYC"}'},
         ])
         assert result == []
 
@@ -169,8 +169,8 @@ class TestFunctionCallGrouping:
         result = tf.transform_input([
             {"type": "message", "role": "user", "content": "Weather in SF?"},
             {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Checking..."}]},
-            {"type": "function_call", "name": "get_weather", "call_id": "call_abc", "arguments": '{"location":"SF"}'},
-            {"type": "function_call_output", "call_id": "call_abc", "output": '{"temp":72}'},
+            {"type": "function_call", "name": "get_weather", "call_id": "call_abc000000000000000000000000", "arguments": '{"location":"SF"}'},
+            {"type": "function_call_output", "call_id": "call_abc000000000000000000000000", "output": '{"temp":72}'},
             {"type": "message", "role": "user", "content": "Thanks!"},
         ])
         # user, assistant+tool_calls, tool, user
@@ -186,8 +186,8 @@ class TestFunctionCallOutputWithListContent:
     @pytest.mark.asyncio
     async def test_function_call_output_with_list_content(self, tf):
         result = tf.transform_input([
-            {"type": "function_call", "name": "get_data", "call_id": "call_1", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "call_1", "output": [
+            {"type": "function_call", "name": "get_weather", "call_id": "call_1000000000000000000000000", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1000000000000000000000000", "output": [
                 {"type": "output_text", "text": "line1"},
                 {"type": "output_text", "text": "line2"},
             ]},
@@ -245,21 +245,21 @@ class TestReasoningPlaceholder:
 
         result = tf.transform_input([
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run it"}]},
-            {"type": "function_call", "name": "shell", "call_id": "call_1", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+            {"type": "function_call", "name": "shell", "call_id": "call_1000000000000000000000000", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1000000000000000000000000", "output": "ok"},
         ])
 
         assistant = result[1]
         assert assistant["role"] == "assistant"
-        assert assistant["tool_calls"][0]["id"] == "call_1"
+        assert assistant["tool_calls"][0]["id"] == "call_1000000000000000000000000"
         assert assistant["reasoning_content"] == MISSING_REASONING_PLACEHOLDER
 
     def test_real_reasoning_is_not_overwritten(self, tf):
         result = tf.transform_input([
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run it"}]},
             {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "real chain"}]},
-            {"type": "function_call", "name": "shell", "call_id": "call_1", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+            {"type": "function_call", "name": "shell", "call_id": "call_1000000000000000000000000", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1000000000000000000000000", "output": "ok"},
         ])
 
         assistant = [m for m in result if m.get("role") == "assistant"][0]

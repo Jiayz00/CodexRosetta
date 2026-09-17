@@ -7,9 +7,13 @@ from codex_rosetta.models.common import (
     BUILTIN_TOOL_TYPES,
     ROSETTA_TOOL_PREFIX,
     ConversionContext,
+    UnsupportedParameterError,
     is_simulated_function,
     make_simulated_function_name,
 )
+from codex_rosetta.utils.logging import get_logger
+
+logger = get_logger("tool_transformer")
 
 
 class ToolTransformer:
@@ -25,6 +29,9 @@ class ToolTransformer:
 
         - Function tools: flatten structure (name/parameters/description from nested `function` key)
         - Built-in tools: simulate as function tools with __rosetta_ prefix
+        - Namespace groups: flatten to `<namespace>__<tool>` and record the mapping
+        - Custom tools: flatten to a single freeform `input` string parameter
+        - Anything else: fail fast instead of silently dropping the tool
         """
         if not responses_tools:
             return []
@@ -39,19 +46,23 @@ class ToolTransformer:
 
         chat_tools: list[dict[str, Any]] = []
 
-        for tool in responses_tools:
+        for index, tool in enumerate(responses_tools):
             tool_type = tool.get("type", "function")
             if tool_type == "namespace":
                 chat_tools.extend(self._convert_namespace_tools(tool, context))
                 continue
-            converted = self._convert_tool(tool, tool_type, context)
+            converted = self._convert_tool(tool, tool_type, context, index)
             if converted is not None:
                 chat_tools.append(converted)
 
         return chat_tools
 
     def _convert_tool(
-        self, tool: dict[str, Any], tool_type: str, context: ConversionContext
+        self,
+        tool: dict[str, Any],
+        tool_type: str,
+        context: ConversionContext,
+        index: int = 0,
     ) -> dict[str, Any] | None:
         if tool_type == "function":
             return self._convert_function_tool(tool)
@@ -62,8 +73,10 @@ class ToolTransformer:
         elif tool_type == "custom":
             return self._convert_custom_tool(tool, context)
 
-        # Unknown tool type — try to pass through
-        return None
+        raise UnsupportedParameterError(
+            f"tools[{index}].type",
+            f"Unsupported tool type: '{tool_type}'.",
+        )
 
     def _convert_function_tool(self, tool: dict[str, Any]) -> dict[str, Any]:
         """Responses function tool -> Chat Completions function tool.
@@ -345,7 +358,7 @@ class ToolTransformer:
     ) -> dict[str, Any]:
         """Convert a custom (freeform) tool to a single-string function.
 
-        Chat Completions API only supports ``type: "function"``. The previous
+        Chat Completions only supports ``type: "function"``; the previous
         implementation returned ``type: "custom"`` which is not understood by
         most upstream providers (e.g. litellm, vLLM) and causes 400 errors.
 
@@ -382,33 +395,59 @@ class ToolTransformer:
     def convert_tool_choice(
         self, tool_choice: Any, context: ConversionContext
     ) -> Any:
-        """Convert tool_choice between formats.
+        """Convert tool_choice between Responses and Chat Completions shapes.
 
-        Responses: {"type": "function", "name": "..."}
+        Responses: {"type": "function", "name": "..."} / {"type": "custom", ...}
+                   {"type": "web_search", ...} / "auto" | "none" | "required"
         ChatCC:    {"type": "function", "function": {"name": "..."}}
+
+        Anything that cannot be pinned down is downgraded to "auto" (with a
+        warning) rather than forwarded in a shape the upstream would reject.
         """
         if tool_choice is None:
             return None
+
         if isinstance(tool_choice, str):
-            return tool_choice
+            if tool_choice in ("auto", "none", "required"):
+                return tool_choice
+            logger.warning("tool_choice_unmappable", tool_choice=tool_choice)
+            return "auto"
 
-        if isinstance(tool_choice, dict):
-            tc_type = tool_choice.get("type", "")
+        if not isinstance(tool_choice, dict):
+            logger.warning("tool_choice_unmappable", tool_choice=repr(tool_choice))
+            return "auto"
 
-            if tc_type == "function":
-                name = tool_choice.get("name", "")
-                # Check if this maps to a simulated built-in tool
-                sim_name = context.original_tool_types.get(name, name) if is_simulated_function(name) else name
-                return {
-                    "type": "function",
-                    "function": {"name": name},
-                }
+        tc_type = tool_choice.get("type", "")
 
-            elif tc_type == "custom":
-                custom = tool_choice.get("custom", {})
-                return {
-                    "type": "custom",
-                    "custom": {"name": custom.get("name", "")},
-                }
+        if tc_type == "function":
+            name = tool_choice.get("name", "")
+            return {
+                "type": "function",
+                "function": {"name": self._forward_name(name, context)},
+            }
 
-        return tool_choice
+        if tc_type == "custom":
+            custom = tool_choice.get("custom", tool_choice)
+            return {
+                "type": "function",
+                "function": {"name": custom.get("name", "")},
+            }
+
+        if tc_type in BUILTIN_TOOL_TYPES:
+            return {
+                "type": "function",
+                "function": {"name": make_simulated_function_name(tc_type)},
+            }
+
+        logger.warning("tool_choice_unmappable", tool_choice=tc_type)
+        return "auto"
+
+    @staticmethod
+    def _forward_name(name: str, context: ConversionContext) -> str:
+        """Map a client-visible function tool_choice name to the upstream name."""
+        if name in context.namespace_tools:
+            return name
+        if "." in name:
+            namespace, _, tool_name = name.rpartition(".")
+            return context.flatten_namespace_tool(namespace, tool_name)
+        return name

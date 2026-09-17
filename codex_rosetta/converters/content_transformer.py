@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from codex_rosetta.models.common import UnsupportedParameterError
+
 
 class ContentTransformer:
     """Convert content parts between Responses API and Chat Completions formats."""
@@ -59,18 +61,30 @@ class ContentTransformer:
             file_id = part.get("file_id")
             file_data = part.get("file_data")
             file_url = part.get("file_url")
-            filename = part.get("filename", "file")
+            filename = part.get("filename")
+
+            if file_id or file_data:
+                file_obj: dict[str, Any] = {}
+                if file_id:
+                    file_obj["file_id"] = file_id
+                if file_data:
+                    file_obj["file_data"] = file_data
+                if filename:
+                    file_obj["filename"] = filename
+                return {"type": "file", "file": file_obj}
 
             if file_url:
-                return {"type": "text", "text": f"[File: {filename}]({file_url})"}
-            elif file_data:
+                # Chat Completions file parts only accept file_id/file_data, so a
+                # URL reference degrades to a text link instead of a fake image.
                 return {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:application/octet-stream;base64,{file_data}"},
+                    "type": "text",
+                    "text": f"[File: {filename or file_url}]({file_url})",
                 }
-            elif file_id:
-                return {"type": "text", "text": f"[File ID: {file_id}]"}
-            return None
+
+            raise UnsupportedParameterError(
+                "input.content.input_file",
+                "input_file requires one of file_id, file_data or file_url.",
+            )
 
         elif part_type == "text":
             return part
@@ -81,8 +95,10 @@ class ContentTransformer:
         elif part_type == "output_text":
             return {"type": "text", "text": part.get("text", "")}
 
-        else:
-            return part
+        raise UnsupportedParameterError(
+            "input.content",
+            f"Unsupported input content part type: '{part_type or 'unknown'}'.",
+        )
 
     def chat_content_to_responses_output(
         self, content: str | list[dict[str, Any]] | None

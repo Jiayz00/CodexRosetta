@@ -6,11 +6,14 @@ from typing import Any, AsyncIterator
 from codex_rosetta.builtin_tools.registry import BuiltinToolRegistry, create_default_registry
 from codex_rosetta.converters.content_transformer import ContentTransformer
 from codex_rosetta.models.common import (
+    EMPTY_ARGUMENTS,
     ConversionContext,
+    derive_phase,
     extract_custom_tool_input,
     extract_original_type,
     is_simulated_function,
 )
+from codex_rosetta.models.responses_api import build_response_envelope
 from codex_rosetta.state.stream_state import OutputItemState, StreamState
 from codex_rosetta.utils.id_generation import generate_item_id, unix_timestamp
 from codex_rosetta.utils.sse import parse_sse_lines
@@ -56,7 +59,7 @@ class StreamConverter:
     @property
     def current_output_items(self) -> list[dict[str, Any]]:
         """Return the current output items as dicts (for conversation store)."""
-        is_incomplete = self._state.finish_reason == "length"
+        status, incomplete_details = self._terminal_status()
         items: list[dict[str, Any]] = []
         for item in self._state.output_items:
             if not self._item_included_in_output(item):
@@ -64,16 +67,22 @@ class StreamConverter:
             if item.item_type == "message":
                 if not item.accumulated_text:
                     continue
-                item_status = "incomplete" if is_incomplete else "completed"
                 msg: dict[str, Any] = {
                     "type": "message",
                     "id": item.item_id,
                     "role": "assistant",
-                    "status": item_status,
-                    "content": [{"type": "output_text", "text": item.accumulated_text, "annotations": []}],
+                    "status": "incomplete" if status == "incomplete" else "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": item.accumulated_text,
+                            "annotations": [],
+                        }
+                    ],
+                    "phase": derive_phase(self._round_has_tool_calls(item)),
                 }
-                if is_incomplete:
-                    msg["incomplete_details"] = {"reason": "max_output_tokens"}
+                if incomplete_details:
+                    msg["incomplete_details"] = incomplete_details
                 items.append(msg)
             elif item.item_type == "reasoning":
                 if not item.accumulated_text:
@@ -105,6 +114,21 @@ class StreamConverter:
                         fc["id"] = item.item_id
                 items.append(fc)
         return items
+
+    def _round_has_tool_calls(self, item: OutputItemState) -> bool:
+        """True when the turn that produced ``item`` also emitted tool calls."""
+        return any(
+            other.item_type == "function_call" and other.round_id == item.round_id
+            for other in self._state.output_items
+        )
+
+    def _terminal_status(self) -> tuple[str, dict[str, Any] | None]:
+        """Map the upstream finish_reason onto a Responses API terminal status."""
+        if self._state.finish_reason == "length":
+            return "incomplete", {"reason": "max_output_tokens"}
+        if self._state.finish_reason == "content_filter":
+            return "incomplete", {"reason": "content_filter"}
+        return "completed", None
 
     def next_sequence_number(self) -> int:
         return self._state.next_sequence_number()
@@ -226,7 +250,7 @@ class StreamConverter:
         # Emit lifecycle start events on first real data
         if not self._state.has_emitted_created:
             self._state.has_emitted_created = True
-            created_evt = self._build_lifecycle_event("response.created", "queued")
+            created_evt = self._build_lifecycle_event("response.created", "in_progress")
             self._record("response.created", created_evt)
             yield "response.created", created_evt
             self._state.has_emitted_in_progress = True
@@ -445,7 +469,7 @@ class StreamConverter:
             "id": item.item_id,
             "call_id": item.call_id,
             "name": item.function_name,
-            "arguments": arguments,
+            "arguments": arguments or EMPTY_ARGUMENTS,
             "status": status,
         }
 
@@ -625,13 +649,19 @@ class StreamConverter:
         completed_at = unix_timestamp()
         full_response = self._build_full_response(completed_at)
 
-        completed_evt = {
-            "type": "response.completed",
+        status = full_response.get("status", "completed")
+        event_type = {
+            "incomplete": "response.incomplete",
+            "failed": "response.failed",
+        }.get(status, "response.completed")
+
+        terminal_evt = {
+            "type": event_type,
             "response": full_response,
             "sequence_number": self._state.next_sequence_number(),
         }
-        self._record("response.completed", completed_evt)
-        yield "response.completed", completed_evt
+        self._record(event_type, terminal_evt)
+        yield event_type, terminal_evt
 
     async def _finalize_message_item(
         self, item: OutputItemState
@@ -669,19 +699,19 @@ class StreamConverter:
             }
 
         if item.has_item_added:
-            is_incomplete = self._state.finish_reason == "length"
-            item_status = "incomplete" if is_incomplete else "completed"
+            status, incomplete_details = self._terminal_status()
             item_data: dict[str, Any] = {
                 "type": "message",
                 "id": item.item_id,
                 "role": "assistant",
-                "status": item_status,
+                "status": "incomplete" if status == "incomplete" else "completed",
                 "content": [
                     {"type": "output_text", "text": item.accumulated_text, "annotations": []}
                 ],
+                "phase": derive_phase(self._round_has_tool_calls(item)),
             }
-            if is_incomplete:
-                item_data["incomplete_details"] = {"reason": "max_output_tokens"}
+            if incomplete_details:
+                item_data["incomplete_details"] = incomplete_details
             yield "response.output_item.done", {
                 "type": "response.output_item.done",
                 "output_index": item.output_index,
@@ -762,12 +792,16 @@ class StreamConverter:
             }
             return
 
+        # `name` must match the tool name the client can actually call back.
+        client_name = self._build_tool_item(
+            item, "completed", item.accumulated_arguments
+        )["name"]
         yield "response.function_call_arguments.done", {
             "type": "response.function_call_arguments.done",
             "output_index": item.output_index,
             "item_id": item.item_id,
-            "name": item.function_name,
-            "arguments": item.accumulated_arguments,
+            "name": client_name,
+            "arguments": item.accumulated_arguments or EMPTY_ARGUMENTS,
             "sequence_number": self._state.next_sequence_number(),
         }
 
@@ -838,6 +872,7 @@ class StreamConverter:
                     "content": [
                         {"type": "output_text", "text": item.accumulated_text, "annotations": []}
                     ],
+                    "phase": derive_phase(self._round_has_tool_calls(item)),
                 })
             elif item.item_type == "reasoning":
                 if not item.accumulated_text:
@@ -870,27 +905,17 @@ class StreamConverter:
                 output.append(fc)
 
         usage = self._convert_usage()
+        status, incomplete_details = self._terminal_status()
 
-        # Map upstream finish_reason to Responses API status
-        is_incomplete = self._state.finish_reason == "length"
-        status = "incomplete" if is_incomplete else "completed"
-
-        response: dict[str, Any] = {
-            "id": self._state.response_id,
-            "object": "response",
-            "created_at": self._state.created_at,
-            "completed_at": completed_at,
-            "model": self._state.model,
-            "status": status,
-            "output": output,
-            "usage": usage,
-            "instructions": self._context.original_instructions,
-        }
-
-        if is_incomplete:
-            response["incomplete_details"] = {"reason": "max_output_tokens"}
-
-        return response
+        return build_response_envelope(
+            self._context,
+            output=output,
+            status=status,
+            usage=usage,
+            incomplete_details=incomplete_details,
+            created_at=self._state.created_at,
+            completed_at=completed_at,
+        )
 
     def _convert_usage(self) -> dict[str, Any]:
         """Convert Chat Completions usage to Responses API usage."""
