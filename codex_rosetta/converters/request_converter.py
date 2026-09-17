@@ -4,7 +4,10 @@ import json
 from typing import Any
 
 from codex_rosetta.converters.content_transformer import ContentTransformer
-from codex_rosetta.converters.input_transformer import InputTransformer
+from codex_rosetta.converters.input_transformer import (
+    InputTransformer,
+    sanitize_tool_call_messages,
+)
 from codex_rosetta.converters.tool_transformer import ToolTransformer
 from codex_rosetta.models.common import ConversionContext, is_simulated_function
 from codex_rosetta.utils.id_generation import generate_response_id
@@ -40,10 +43,18 @@ class RequestConverter:
         # Model
         chat_request["model"] = responses_request.get("model", "")
 
+        # Tools — converted before the input so that replayed namespaced tool
+        # calls can be mapped back to their flattened upstream names.
+        tools = responses_request.get("tools", [])
+        if tools:
+            chat_tools = self._tool_tf.convert_tools(tools, context)
+            if chat_tools:
+                chat_request["tools"] = chat_tools
+
         # Messages from input
         input_data = responses_request.get("input", "")
         instructions = responses_request.get("instructions")
-        messages = self._input_tf.transform_input(input_data, instructions)
+        messages = self._input_tf.transform_input(input_data, instructions, context)
 
         # If previous_response_id provided, prepend stored conversation history
         if conversation_messages:
@@ -52,14 +63,8 @@ class RequestConverter:
             non_system_msgs = [m for m in messages if m.get("role") != "system"]
             messages = system_msgs + conversation_messages + non_system_msgs
 
+        messages = sanitize_tool_call_messages(messages)
         chat_request["messages"] = messages
-
-        # Tools
-        tools = responses_request.get("tools", [])
-        if tools:
-            chat_tools = self._tool_tf.convert_tools(tools, context)
-            if chat_tools:
-                chat_request["tools"] = chat_tools
 
         # Tool choice
         tool_choice = responses_request.get("tool_choice")

@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 33131
 
+    # Model advertised by GET /v1/models (clients probe it for reachability).
+    # Empty means "no models listed", which still answers 200.
+    MODELS_MODEL_ID: str = ""
+
+    # Comma-separated model IDs that must not be forwarded upstream.
+    BLOCKED_MODEL_IDS: str = ""
+
     # Timeouts
     UPSTREAM_TIMEOUT_CONNECT: float = 10.0
     UPSTREAM_TIMEOUT_READ: float = 300.0

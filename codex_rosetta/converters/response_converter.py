@@ -5,8 +5,9 @@ from typing import Any
 from codex_rosetta.converters.content_transformer import ContentTransformer
 from codex_rosetta.models.common import (
     ConversionContext,
-    is_simulated_function,
+    extract_custom_tool_input,
     extract_original_type,
+    is_simulated_function,
 )
 from codex_rosetta.utils.id_generation import generate_item_id, unix_timestamp
 
@@ -142,11 +143,23 @@ class ResponseConverter:
             name = func.get("name", "")
             arguments = func.get("arguments", "{}")
 
+            # Custom (freeform) tools are exposed upstream as single-string
+            # functions; restore the `custom_tool_call` shape.
+            if name in context.custom_tool_names:
+                return {
+                    "type": "custom_tool_call",
+                    "id": generate_item_id("custom_tool_call"),
+                    "call_id": call_id,
+                    "name": name,
+                    "input": extract_custom_tool_input(arguments),
+                    "status": "completed",
+                }
+
             # Check if this maps to a simulated built-in tool
             if is_simulated_function(name):
                 return self._convert_simulated_builtin(name, arguments, call_id, context)
 
-            return {
+            item: dict[str, Any] = {
                 "type": "function_call",
                 "id": generate_item_id("function_call"),
                 "call_id": call_id,
@@ -154,6 +167,14 @@ class ResponseConverter:
                 "arguments": arguments,
                 "status": "completed",
             }
+
+            # Restore the namespace the client declared this tool in
+            namespace_pair = context.resolve_namespace_tool(name)
+            if namespace_pair:
+                item["name"] = namespace_pair[1]
+                item["namespace"] = namespace_pair[0]
+
+            return item
 
         elif tc_type == "custom":
             custom = tool_call.get("custom", {})

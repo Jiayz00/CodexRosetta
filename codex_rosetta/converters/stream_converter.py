@@ -5,7 +5,12 @@ from typing import Any, AsyncIterator
 
 from codex_rosetta.builtin_tools.registry import BuiltinToolRegistry, create_default_registry
 from codex_rosetta.converters.content_transformer import ContentTransformer
-from codex_rosetta.models.common import ConversionContext, extract_original_type, is_simulated_function
+from codex_rosetta.models.common import (
+    ConversionContext,
+    extract_custom_tool_input,
+    extract_original_type,
+    is_simulated_function,
+)
 from codex_rosetta.state.stream_state import OutputItemState, StreamState
 from codex_rosetta.utils.id_generation import generate_item_id, unix_timestamp
 from codex_rosetta.utils.sse import parse_sse_lines
@@ -82,14 +87,9 @@ class StreamConverter:
                     "status": "completed",
                 })
             elif item.item_type == "function_call":
-                fc: dict[str, Any] = {
-                    "type": "function_call",
-                    "id": item.item_id,
-                    "call_id": item.call_id,
-                    "name": item.function_name,
-                    "arguments": item.accumulated_arguments,
-                    "status": "completed",
-                }
+                fc: dict[str, Any] = self._build_tool_item(
+                    item, "completed", item.accumulated_arguments
+                )
                 # Check for built-in tool reverse mapping
                 if item.function_name and is_simulated_function(item.function_name):
                     original_type = extract_original_type(item.function_name)
@@ -416,6 +416,46 @@ class StreamConverter:
 
         reasoning_item.accumulated_text += reasoning_text
 
+    def _is_custom_item(self, item: OutputItemState) -> bool:
+        """True when this output item is a custom (freeform) tool call."""
+        return bool(item.function_name) and (
+            item.function_name in self._context.custom_tool_names
+        )
+
+    def _build_tool_item(
+        self, item: OutputItemState, status: str, arguments: str
+    ) -> dict[str, Any]:
+        """Build a function_call / custom_tool_call item for the client.
+
+        Namespaced tools are sent upstream as ``<namespace>__<tool>``; the
+        client expects the bare tool name plus a ``namespace`` field.
+        """
+        if self._is_custom_item(item):
+            return {
+                "type": "custom_tool_call",
+                "id": item.item_id,
+                "call_id": item.call_id,
+                "name": item.function_name,
+                "input": extract_custom_tool_input(arguments),
+                "status": status,
+            }
+
+        built: dict[str, Any] = {
+            "type": "function_call",
+            "id": item.item_id,
+            "call_id": item.call_id,
+            "name": item.function_name,
+            "arguments": arguments,
+            "status": status,
+        }
+
+        namespace_pair = self._context.resolve_namespace_tool(item.function_name or "")
+        if namespace_pair:
+            built["name"] = namespace_pair[1]
+            built["namespace"] = namespace_pair[0]
+
+        return built
+
     async def _handle_tool_call_delta(
         self, tc_delta: dict[str, Any]
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
@@ -462,14 +502,7 @@ class StreamConverter:
                     action["queries"] = []
                     action["sources"] = []
             else:
-                added_item = {
-                    "type": "function_call",
-                    "id": fc_item.item_id,
-                    "call_id": call_id,
-                    "name": func_name,
-                    "arguments": "",
-                    "status": "in_progress",
-                }
+                added_item = self._build_tool_item(fc_item, "in_progress", "")
 
             yield "response.output_item.added", {
                 "type": "response.output_item.added",
@@ -483,7 +516,11 @@ class StreamConverter:
         # Arguments delta
         func_info = tc_delta.get("function") or {}
         args_delta = func_info.get("arguments", "")
-        if args_delta:
+        if args_delta and self._is_custom_item(fc_item):
+            # Freeform input arrives as JSON fragments; buffer them and emit
+            # the extracted text once the call is finalized.
+            fc_item.accumulated_arguments += args_delta
+        elif args_delta:
             # Emit built-in tool lifecycle events on first argument delta
             if fc_item.original_tool_type and not fc_item.has_emitted_lifecycle:
                 fc_item.has_emitted_lifecycle = True
@@ -701,6 +738,30 @@ class StreamConverter:
             # The router completes these items after the real search ran so
             # status and sources are accurate.
             return
+        if self._is_custom_item(item):
+            text = extract_custom_tool_input(item.accumulated_arguments)
+            yield "response.custom_tool_call_input.delta", {
+                "type": "response.custom_tool_call_input.delta",
+                "output_index": item.output_index,
+                "item_id": item.item_id,
+                "delta": text,
+                "sequence_number": self._state.next_sequence_number(),
+            }
+            yield "response.custom_tool_call_input.done", {
+                "type": "response.custom_tool_call_input.done",
+                "output_index": item.output_index,
+                "item_id": item.item_id,
+                "input": text,
+                "sequence_number": self._state.next_sequence_number(),
+            }
+            yield "response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": item.output_index,
+                "item": self._build_tool_item(item, "completed", item.accumulated_arguments),
+                "sequence_number": self._state.next_sequence_number(),
+            }
+            return
+
         yield "response.function_call_arguments.done", {
             "type": "response.function_call_arguments.done",
             "output_index": item.output_index,
@@ -711,14 +772,9 @@ class StreamConverter:
         }
 
         # Build final item dict
-        final_item: dict[str, Any] = {
-            "type": "function_call",
-            "id": item.item_id,
-            "call_id": item.call_id,
-            "name": item.function_name,
-            "arguments": item.accumulated_arguments,
-            "status": "completed",
-        }
+        final_item: dict[str, Any] = self._build_tool_item(
+            item, "completed", item.accumulated_arguments
+        )
 
         # Check for built-in tool reverse mapping
         if item.function_name and is_simulated_function(item.function_name):
@@ -795,14 +851,9 @@ class StreamConverter:
                     "status": "completed",
                 })
             elif item.item_type == "function_call":
-                fc: dict[str, Any] = {
-                    "type": "function_call",
-                    "id": item.item_id,
-                    "call_id": item.call_id,
-                    "name": item.function_name,
-                    "arguments": item.accumulated_arguments,
-                    "status": "completed",
-                }
+                fc: dict[str, Any] = self._build_tool_item(
+                    item, "completed", item.accumulated_arguments
+                )
                 # Built-in tool reverse mapping
                 if item.function_name and is_simulated_function(item.function_name):
                     original_type = extract_original_type(item.function_name)

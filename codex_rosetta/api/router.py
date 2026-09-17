@@ -27,6 +27,7 @@ from codex_rosetta.search.pool import (
     SearchProviderPool,
     get_search_pool,
 )
+from codex_rosetta.utils.id_generation import generate_response_id
 from codex_rosetta.utils.logging import get_logger
 from codex_rosetta.utils.sse import format_sse_event
 
@@ -38,6 +39,23 @@ router = APIRouter()
 @router.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@router.get("/v1/models")
+async def list_models() -> dict[str, Any]:
+    """Minimal model list.
+
+    Codex probes `GET {base_url}/models` for reachability and treats a 404 as a
+    misconfigured API prefix, so this answers 200 even when no model is
+    configured. Model selection itself is driven by the client's own catalog.
+    """
+    model_id = get_settings().MODELS_MODEL_ID.strip()
+    data = (
+        [{"id": model_id, "object": "model", "owned_by": "codex-rosetta"}]
+        if model_id
+        else []
+    )
+    return {"object": "list", "data": data}
 
 
 def _get_search_provider() -> SearchProvider | None:
@@ -64,6 +82,23 @@ async def create_response(request: Request):
     log = logger.bind(request_id=request_id)
 
     body = await request.json()
+
+    blocked_models = {
+        model.strip()
+        for model in get_settings().BLOCKED_MODEL_IDS.split(",")
+        if model.strip()
+    }
+    requested_model = body.get("model", "")
+    if requested_model in blocked_models:
+        log.warning("blocked_model", model=requested_model)
+        return JSONResponse(
+            status_code=400,
+            content=_make_error_response(
+                generate_response_id(),
+                "model_not_supported",
+                f"Model '{requested_model}' is not supported by this gateway.",
+            ),
+        )
 
     auditor = getattr(request.state, "auditor", NoOpAuditLogger())
 
