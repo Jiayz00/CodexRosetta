@@ -212,3 +212,154 @@ class TestSearchToolDetection:
                 "function": {"name": "get_weather"},
             }]
         }) is False
+
+
+class TestErrorAwareFormatter:
+    def test_error_response_renders_unavailable_instruction(self):
+        from codex_rosetta.search.base import ERROR_QUOTA_EXCEEDED
+
+        output = format_search_results(
+            SearchResponse(error=ERROR_QUOTA_EXCEEDED, error_detail="HTTP 432: quota")
+        )
+        assert "搜索服务暂不可用" in output
+        assert "搜索服务额度已用尽" in output
+        assert "不要再用 web_search 重试" in output
+
+    def test_rejected_query_asks_for_a_rephrase(self):
+        from codex_rosetta.search.base import ERROR_INVALID_QUERY
+
+        output = format_search_results(SearchResponse(
+            error=ERROR_INVALID_QUERY,
+            error_detail="HTTP 400: Query cannot consist only of site: operators.",
+        ))
+        assert "搜索查询被拒绝" in output
+        assert "重新调用 web_search" in output
+        assert "暂不可用" not in output
+
+    def test_empty_response_is_not_an_error(self):
+        output = format_search_results(SearchResponse(results=[], query="nothing"))
+        assert "未返回任何结果" in output
+        assert "暂不可用" not in output
+
+    def test_search_response_error_flag(self):
+        from codex_rosetta.search.base import ERROR_INVALID_KEY
+
+        assert SearchResponse(results=[]).ok is True
+        assert SearchResponse(error=ERROR_INVALID_KEY).ok is False
+
+
+class TestProviderErrorClassification:
+    @staticmethod
+    def _tavily():
+        from codex_rosetta.search.tavily_provider import TavilySearchProvider
+
+        return TavilySearchProvider
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status,expected",
+        [
+            (400, "invalid_query"),
+            (401, "invalid_key"),
+            (403, "invalid_key"),
+            (432, "quota_exceeded"),
+            (429, "rate_limited"),
+            (503, "upstream_error"),
+        ],
+    )
+    async def test_tavily_maps_http_status(self, status, expected):
+        import httpx
+
+        provider = self._tavily()(api_key="test-key")
+        await provider._client.aclose()
+        provider._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(status, text="boom"))
+        )
+
+        response = await provider.search("query")
+
+        assert response.error == expected
+        assert response.error_detail.startswith(f"HTTP {status}")
+        assert response.results == []
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_tavily_reports_network_error(self):
+        import httpx
+
+        def handler(request):
+            raise httpx.ConnectError("dns failure", request=request)
+
+        provider = self._tavily()(api_key="test-key")
+        await provider._client.aclose()
+        provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        response = await provider.search("query")
+
+        assert response.error == "network_error"
+        assert "dns failure" in response.error_detail
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_tavily_success_is_unchanged(self):
+        import httpx
+
+        payload = {
+            "results": [
+                {"title": "T", "url": "https://example.com", "content": "snippet"},
+            ]
+        }
+        provider = self._tavily()(api_key="test-key")
+        await provider._client.aclose()
+        provider._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+        )
+
+        response = await provider.search("query")
+
+        assert response.error is None
+        assert response.results[0].title == "T"
+        await provider.close()
+
+
+class TestDuckDuckGoProvider:
+    def test_module_imports(self):
+        # Regression: _search_direct() used to be missing its `try:` block,
+        # which made the whole module fail to import.
+        import importlib
+
+        module = importlib.import_module("codex_rosetta.search.duckduckgo_provider")
+        assert hasattr(module, "DuckDuckGoSearchProvider")
+
+    def test_html_result_parsing(self):
+        from codex_rosetta.search.duckduckgo_provider import DuckDuckGoSearchProvider
+
+        provider = DuckDuckGoSearchProvider()
+        html = (
+            '<a class="result__a" href="https://example.com/one">First <b>Title</b></a>'
+            '<a class="result__snippet">First snippet</a>'
+            '<a class="result__a" href="https://example.com/two">Second</a>'
+            '<a class="result__snippet">Second snippet</a>'
+        )
+
+        results = provider._parse_html_results(html, max_results=5)
+
+        assert [r.title for r in results] == ["First Title", "Second"]
+        assert [r.url for r in results] == [
+            "https://example.com/one",
+            "https://example.com/two",
+        ]
+        assert results[0].snippet == "First snippet"
+
+    def test_html_parsing_respects_max_results(self):
+        from codex_rosetta.search.duckduckgo_provider import DuckDuckGoSearchProvider
+
+        provider = DuckDuckGoSearchProvider()
+        html = "".join(
+            f'<a class="result__a" href="https://example.com/{i}">T{i}</a>'
+            f'<a class="result__snippet">S{i}</a>'
+            for i in range(5)
+        )
+
+        results = provider._parse_html_results(html, max_results=2)
+        assert len(results) == 2

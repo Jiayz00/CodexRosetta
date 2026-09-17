@@ -24,6 +24,9 @@ class OutputItemState:
     original_tool_type: str | None = None
     has_emitted_lifecycle: bool = False
     round_id: int = 0
+    # Sources reported by the search backend, attached to built-in tool items
+    # so they survive round transitions and show up in the final response.
+    builtin_sources: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

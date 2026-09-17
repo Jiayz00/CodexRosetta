@@ -314,7 +314,7 @@ class TestMixedTextAndToolCalls:
 
 class TestRoundFiltering:
     @pytest.mark.asyncio
-    async def test_current_output_items_only_include_latest_round(self, ctx):
+    async def test_current_output_items_keep_search_items_and_latest_round(self, ctx):
         sim_name = make_simulated_function_name("web_search")
         ctx.register_builtin_tool(sim_name, "web_search")
 
@@ -336,11 +336,14 @@ class TestRoundFiltering:
             pass
 
         items = sc.current_output_items
-        assert [item["type"] for item in items] == ["message"]
-        assert items[0]["content"][0]["text"] == "Final answer"
+        # Built-in tool items survive the round transition so the client keeps
+        # the visible search history; chat items only reflect the last round.
+        assert [item["type"] for item in items] == ["web_search_call", "message"]
+        assert items[0]["action"]["queries"] == ["AI news"]
+        assert items[1]["content"][0]["text"] == "Final answer"
 
     @pytest.mark.asyncio
-    async def test_completed_response_only_includes_latest_round(self, ctx):
+    async def test_completed_response_includes_search_and_latest_round(self, ctx):
         sim_name = make_simulated_function_name("web_search")
         ctx.register_builtin_tool(sim_name, "web_search")
 
@@ -367,5 +370,6 @@ class TestRoundFiltering:
 
         completed = [event for event in events if event[0] == "response.completed"][0][1]
         output = completed["response"]["output"]
-        assert [item["type"] for item in output] == ["message"]
-        assert output[0]["content"][0]["text"] == "Final answer"
+        assert [item["type"] for item in output] == ["web_search_call", "message"]
+        assert output[0]["action"]["queries"] == ["AI news"]
+        assert output[1]["content"][0]["text"] == "Final answer"

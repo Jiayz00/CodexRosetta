@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     WEB_SEARCH_API_KEY: str = ""
     WEB_SEARCH_MAX_RESULTS: int = 5
     WEB_SEARCH_MAX_ROUNDS: int = 3
+    # Search credential pool (ordered by priority). Missing file is seeded from
+    # the legacy single-credential WEB_SEARCH_* settings above.
+    SEARCH_POOL_FILE: str = "data/search_pool.json"
+    # Deprecated: kept only so existing .env files keep loading. Search rounds
+    # are streamed live now, so the simulated replay knobs are unused.
     WEB_SEARCH_SIMULATED_STREAMING_ENABLED: bool = True
     WEB_SEARCH_SIMULATED_STREAM_DELAY_MS: int = 25
     WEB_SEARCH_SIMULATED_STREAM_MAX_CHARS: int = 32

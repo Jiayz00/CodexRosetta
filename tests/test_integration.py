@@ -3,7 +3,23 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from codex_rosetta.main import app
+from codex_rosetta.search.base import SearchResponse, SearchResult
 from codex_rosetta.state.conversation_store import InMemoryConversationStore
+
+
+def parse_events(content: bytes) -> list[dict]:
+    """Parse a Responses API SSE payload into [{event, data}, ...]."""
+    events = []
+    event_type = None
+    for line in content.decode().split("\n"):
+        if line.startswith("event:"):
+            event_type = line[6:].strip()
+        elif line.startswith("data:"):
+            try:
+                events.append({"event": event_type, "data": json.loads(line[5:].strip())})
+            except json.JSONDecodeError:
+                pass
+    return events
 
 
 @pytest.fixture
@@ -206,7 +222,7 @@ class TestStreamingProxy:
         assert "Hello" in texts
         assert " world" in texts
 
-    def test_streaming_search_hides_intermediate_rounds(self, mock_upstream, mock_store):
+    def test_streaming_search_streams_rounds_live(self, mock_upstream, mock_store):
         first_round = [
             b'data: {"id":"chatcmpl-search-1","object":"chat.completion.chunk","created":1746000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}\n\n',
             b'data: {"id":"chatcmpl-search-1","object":"chat.completion.chunk","created":1746000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Let me search for that."},"finish_reason":null}]}\n\n',
@@ -233,9 +249,15 @@ class TestStreamingProxy:
         mock_upstream.chat_completions_stream = mock_stream
 
         mock_search_provider = AsyncMock()
-        mock_search_provider.search.return_value = MagicMock(
+        mock_search_provider.search.return_value = SearchResponse(
             query="SearXNG project what is it",
-            results=[MagicMock(title="SearXNG", url="https://example.com", snippet="meta search")],
+            results=[
+                SearchResult(
+                    title="SearXNG",
+                    url="https://example.com",
+                    snippet="meta search",
+                )
+            ],
         )
 
         with patch("codex_rosetta.api.router.get_upstream_client", return_value=mock_upstream), \
@@ -254,74 +276,77 @@ class TestStreamingProxy:
         assert call_count["count"] == 2
         mock_search_provider.search.assert_awaited_once()
 
-        content = resp.content.decode()
-        events = []
-        event_type = None
-        for line in content.split("\n"):
-            if line.startswith("event:"):
-                event_type = line[6:].strip()
-            elif line.startswith("data:"):
-                data_str = line[5:].strip()
-                try:
-                    events.append({"event": event_type, "data": json.loads(data_str)})
-                except json.JSONDecodeError:
-                    pass
+        events = parse_events(resp.content)
+        event_types = [e["event"] for e in events]
+
+        # the search lifecycle is visible while it happens
+        assert "response.web_search_call.in_progress" in event_types
+        assert "response.web_search_call.searching" in event_types
+        assert "response.web_search_call.completed" in event_types
 
         deltas = [e["data"]["delta"] for e in events if e["event"] == "response.output_text.delta"]
         combined = "".join(deltas)
-
-        assert "Let me search for that." not in combined
+        # both rounds stream live now, including the short "let me search" text
+        assert "Let me search for that." in combined
         assert "SearXNG is an open-source metasearch engine." in combined
-        assert "It aggregates results from multiple search providers." in combined
 
         completed = [e for e in events if e["event"] == "response.completed"][0]["data"]
-        output_text = completed["response"]["output"][0]["content"][0]["text"]
-        assert "Let me search for that." not in output_text
+        output = completed["response"]["output"]
+        assert [item["type"] for item in output] == ["web_search_call", "message"]
+        assert output[0]["status"] == "completed"
+        assert output[0]["action"]["sources"] == [
+            {"type": "url", "url": "https://example.com"}
+        ]
+        output_text = output[1]["content"][0]["text"]
+        # only the last round's assistant text survives into the final output
         assert "SearXNG is an open-source metasearch engine." in output_text
-        output_types = [item["type"] for item in completed["response"]["output"]]
-        assert output_types == ["message"]
+        assert "Let me search for that." not in output_text
 
-    def test_streaming_search_simulates_multiple_final_deltas(self, mock_upstream, mock_store):
+    def test_streaming_search_answer_deltas_are_not_simulated(self, mock_upstream, mock_store):
         first_round = [
             b'data: {"id":"chatcmpl-search-1","object":"chat.completion.chunk","created":1746000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ws","type":"function","function":{"name":"__rosetta_web_search","arguments":"{\\"query\\":\\"SearXNG project what is it\\"}"}}]},"finish_reason":null}]}\n\n',
             b'data: {"id":"chatcmpl-search-1","object":"chat.completion.chunk","created":1746000000,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
             b'data: [DONE]\n\n',
         ]
+        answer = (
+            "SearXNG is an open-source metasearch engine that aggregates results "
+            "from multiple providers into a single interface."
+        )
         final_round = [
             b'data: {"id":"chatcmpl-search-2","object":"chat.completion.chunk","created":1746000001,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}\n\n',
-            b'data: {"id":"chatcmpl-search-2","object":"chat.completion.chunk","created":1746000001,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"SearXNG is an open-source metasearch engine that aggregates results from multiple providers into a single interface."},"finish_reason":null}]}\n\n',
+            (
+                'data: {"id":"chatcmpl-search-2","object":"chat.completion.chunk","created":1746000001,'
+                '"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"' + answer + '"},"finish_reason":null}]}\n\n'
+            ).encode(),
             b'data: {"id":"chatcmpl-search-2","object":"chat.completion.chunk","created":1746000001,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":12,"total_tokens":32}}\n\n',
             b'data: [DONE]\n\n',
         ]
 
-        call_count = {"count": 0}
+        requests: list[dict] = []
 
-        async def mock_stream(*args, **kwargs):
-            call_count["count"] += 1
-            chunks = first_round if call_count["count"] == 1 else final_round
+        async def mock_stream(request, *args, **kwargs):
+            requests.append(request)
+            chunks = first_round if len(requests) == 1 else final_round
             for chunk in chunks:
                 yield chunk
 
         mock_upstream.chat_completions_stream = mock_stream
 
         mock_search_provider = AsyncMock()
-        mock_search_provider.search.return_value = MagicMock(
+        mock_search_provider.search.return_value = SearchResponse(
             query="SearXNG project what is it",
-            results=[MagicMock(title="SearXNG", url="https://example.com", snippet="meta search")],
+            results=[
+                SearchResult(
+                    title="SearXNG",
+                    url="https://example.com",
+                    snippet="meta search",
+                )
+            ],
         )
 
         with patch("codex_rosetta.api.router.get_upstream_client", return_value=mock_upstream), \
              patch("codex_rosetta.api.router.get_conversation_store", return_value=mock_store), \
-             patch("codex_rosetta.api.router._get_search_provider", return_value=mock_search_provider), \
-             patch("codex_rosetta.api.router.get_settings") as mock_get_settings:
-            settings = MagicMock()
-            settings.WEB_SEARCH_SIMULATED_STREAMING_ENABLED = True
-            settings.WEB_SEARCH_SIMULATED_STREAM_DELAY_MS = 0
-            settings.WEB_SEARCH_SIMULATED_STREAM_MAX_CHARS = 20
-            settings.WEB_SEARCH_MAX_ROUNDS = 3
-            settings.WEB_SEARCH_MAX_RESULTS = 5
-            mock_get_settings.return_value = settings
-
+             patch("codex_rosetta.api.router._get_search_provider", return_value=mock_search_provider):
             from fastapi.testclient import TestClient
             with TestClient(app) as client:
                 resp = client.post("/v1/responses", json={
@@ -332,21 +357,16 @@ class TestStreamingProxy:
                 })
 
         assert resp.status_code == 200
-        assert call_count["count"] == 2
+        assert len(requests) == 2
 
-        content = resp.content.decode()
-        events = []
-        event_type = None
-        for line in content.split("\n"):
-            if line.startswith("event:"):
-                event_type = line[6:].strip()
-            elif line.startswith("data:"):
-                data_str = line[5:].strip()
-                try:
-                    events.append({"event": event_type, "data": json.loads(data_str)})
-                except json.JSONDecodeError:
-                    pass
-
+        events = parse_events(resp.content)
         deltas = [e["data"]["delta"] for e in events if e["event"] == "response.output_text.delta"]
-        assert len(deltas) >= 3
-        assert "".join(deltas).startswith("SearXNG is an open-source metasearch engine")
+        # no artificial chunk splitting: one upstream delta, one client delta
+        assert "".join(deltas) == answer
+
+        completed = [e for e in events if e["event"] == "response.completed"][0]["data"]
+        assert completed["response"]["output"][1]["content"][0]["text"] == answer
+
+        # the second round carries the real search digest for the model
+        tool_messages = [m for m in requests[1]["messages"] if m.get("role") == "tool"]
+        assert tool_messages and "https://example.com" in tool_messages[0]["content"]
