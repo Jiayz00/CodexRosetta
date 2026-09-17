@@ -3,7 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 from codex_rosetta.converters.content_transformer import ContentTransformer
-from codex_rosetta.converters.input_transformer import InputTransformer
+from codex_rosetta.converters.input_transformer import (
+    InputTransformer,
+    sanitize_tool_call_messages,
+)
 from codex_rosetta.converters.tool_transformer import ToolTransformer
 from codex_rosetta.models.common import ConversionContext, is_simulated_function
 from codex_rosetta.utils.id_generation import generate_response_id
@@ -59,6 +62,7 @@ class RequestConverter:
             non_system_msgs = [m for m in messages if m.get("role") != "system"]
             messages = system_msgs + conversation_messages + non_system_msgs
 
+        messages = sanitize_tool_call_messages(messages)
         chat_request["messages"] = messages
 
         # Tool choice

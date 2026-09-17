@@ -19,6 +19,7 @@ from codex_rosetta.converters.stream_converter import StreamConverter
 from codex_rosetta.models.common import is_simulated_function, extract_original_type, ROSETTA_TOOL_PREFIX
 from codex_rosetta.search.base import SearchProvider
 from codex_rosetta.search.formatter import format_search_results
+from codex_rosetta.utils.id_generation import generate_response_id
 from codex_rosetta.utils.logging import get_logger
 from codex_rosetta.utils.sse import format_sse_event
 
@@ -93,6 +94,23 @@ async def create_response(request: Request):
     log = logger.bind(request_id=request_id)
 
     body = await request.json()
+
+    blocked_models = {
+        model.strip()
+        for model in get_settings().BLOCKED_MODEL_IDS.split(",")
+        if model.strip()
+    }
+    requested_model = body.get("model", "")
+    if requested_model in blocked_models:
+        log.warning("blocked_model", model=requested_model)
+        return JSONResponse(
+            status_code=400,
+            content=_make_error_response(
+                generate_response_id(),
+                "model_not_supported",
+                f"Model '{requested_model}' is not supported by this gateway.",
+            ),
+        )
 
     auditor = getattr(request.state, "auditor", NoOpAuditLogger())
 

@@ -2,6 +2,7 @@ import pytest
 
 from codex_rosetta.converters.content_transformer import ContentTransformer
 from codex_rosetta.converters.input_transformer import InputTransformer
+from codex_rosetta.converters.request_converter import RequestConverter
 
 
 @pytest.fixture
@@ -74,14 +75,61 @@ class TestFunctionCallGrouping:
             {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Let me check."}]},
             {"type": "function_call", "name": "get_weather", "call_id": "call_abc", "arguments": '{"location":"SF"}'},
         ])
-        # Should be: user msg + assistant msg with tool_calls
+        # The unanswered call cannot be sent to Chat Completions, but the
+        # assistant text is preserved.
         assert len(result) == 2
         assert result[1]["role"] == "assistant"
         assert result[1]["content"] == "Let me check."
-        assert len(result[1]["tool_calls"]) == 1
-        assert result[1]["tool_calls"][0]["id"] == "call_abc"
-        assert result[1]["tool_calls"][0]["function"]["name"] == "get_weather"
-        assert result[1]["tool_calls"][0]["function"]["arguments"] == '{"location":"SF"}'
+        assert "tool_calls" not in result[1]
+
+    @pytest.mark.asyncio
+    async def test_orphan_function_call_output_becomes_user_message(self, tf):
+        delegation = "<codex_delegation>\n  <source_thread_id>parent</source_thread_id>\n  <input>do work</input>\n</codex_delegation>"
+        result = tf.transform_input([
+            {"type": "message", "role": "developer", "content": "context"},
+            {"type": "message", "role": "user", "content": "instructions"},
+            {
+                "type": "function_call_output",
+                "id": "fco_01a0b026-4af2-7950-bb2f-d276b77900c1",
+                "name": "create_thread",
+                "namespace": "codex_app",
+                "output": delegation,
+            },
+        ])
+        assert result[-1] == {"role": "user", "content": delegation}
+        assert all(message.get("role") != "tool" for message in result)
+
+    @pytest.mark.asyncio
+    async def test_orphan_custom_tool_output_becomes_user_message(self, tf):
+        result = tf.transform_input([
+            {
+                "type": "custom_tool_call_output",
+                "id": "ctco_1",
+                "name": "apply_patch",
+                "output": "orphan output",
+            },
+        ])
+        assert result == [{"role": "user", "content": "orphan output"}]
+
+    @pytest.mark.asyncio
+    async def test_orphan_tool_call_is_removed_before_next_message(self, tf):
+        result = tf.transform_input([
+            {"type": "message", "role": "assistant", "content": None},
+            {"type": "function_call", "name": "get_weather", "call_id": "call_abc", "arguments": "{}"},
+            {"type": "message", "role": "user", "content": "continue"},
+        ])
+        assert result == [{"role": "user", "content": "continue"}]
+
+    @pytest.mark.asyncio
+    async def test_partial_tool_results_remove_only_orphan_tool_call(self, tf):
+        result = tf.transform_input([
+            {"type": "function_call", "name": "first", "call_id": "call_1", "arguments": "{}"},
+            {"type": "function_call", "name": "second", "call_id": "call_2", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+        ])
+        assert len(result) == 2
+        assert [tc["id"] for tc in result[0]["tool_calls"]] == ["call_1"]
+        assert result[1]["tool_call_id"] == "call_1"
 
     @pytest.mark.asyncio
     async def test_function_call_output(self, tf):
@@ -104,9 +152,7 @@ class TestFunctionCallGrouping:
             {"type": "message", "role": "assistant", "content": None},
             {"type": "function_call", "name": "get_weather", "call_id": "call_1", "arguments": '{}'},
         ])
-        assert result[0]["role"] == "assistant"
-        assert result[0]["content"] is None
-        assert len(result[0]["tool_calls"]) == 1
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_parallel_tool_calls(self, tf):
@@ -115,9 +161,7 @@ class TestFunctionCallGrouping:
             {"type": "function_call", "name": "get_weather", "call_id": "call_1", "arguments": '{"location":"SF"}'},
             {"type": "function_call", "name": "get_weather", "call_id": "call_2", "arguments": '{"location":"NYC"}'},
         ])
-        assert len(result[0]["tool_calls"]) == 2
-        assert result[0]["tool_calls"][0]["id"] == "call_1"
-        assert result[0]["tool_calls"][1]["id"] == "call_2"
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_full_tool_call_lifecycle(self, tf):
@@ -142,14 +186,38 @@ class TestFunctionCallOutputWithListContent:
     @pytest.mark.asyncio
     async def test_function_call_output_with_list_content(self, tf):
         result = tf.transform_input([
+            {"type": "function_call", "name": "get_data", "call_id": "call_1", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "call_1", "output": [
                 {"type": "output_text", "text": "line1"},
                 {"type": "output_text", "text": "line2"},
             ]},
         ])
-        assert result[0]["role"] == "tool"
-        assert "line1" in result[0]["content"]
-        assert "line2" in result[0]["content"]
+        assert result[0]["role"] == "assistant"
+        assert result[1]["role"] == "tool"
+        assert "line1" in result[1]["content"]
+        assert "line2" in result[1]["content"]
+
+
+class TestHistoricalToolCallSanitization:
+    @pytest.mark.asyncio
+    async def test_request_converter_removes_historical_orphan_tool_call(self):
+        chat_request, _ = await RequestConverter().convert(
+            {"model": "gpt-4o", "input": "continue"},
+            conversation_messages=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_orphan",
+                            "type": "function",
+                            "function": {"name": "missing", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ],
+        )
+        assert all(not message.get("tool_calls") for message in chat_request["messages"])
 
 
 class TestMixedContent:

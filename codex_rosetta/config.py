@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     # Empty means "no models listed", which still answers 200.
     MODELS_MODEL_ID: str = ""
 
+    # Comma-separated model IDs that must not be forwarded upstream.
+    BLOCKED_MODEL_IDS: str = ""
+
     # Timeouts
     UPSTREAM_TIMEOUT_CONNECT: float = 10.0
     UPSTREAM_TIMEOUT_READ: float = 300.0
