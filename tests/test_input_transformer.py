@@ -166,3 +166,43 @@ class TestMixedContent:
         assert len(content) == 2
         assert content[0]["type"] == "text"
         assert content[1]["type"] == "image_url"
+
+class TestReasoningPlaceholder:
+    """Thinking-mode upstreams reject tool_calls turns without reasoning_content."""
+
+    def test_tool_call_without_reasoning_gets_placeholder(self, tf):
+        from codex_rosetta.converters.input_transformer import (
+            MISSING_REASONING_PLACEHOLDER,
+        )
+
+        result = tf.transform_input([
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run it"}]},
+            {"type": "function_call", "name": "shell", "call_id": "call_1", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+        ])
+
+        assistant = result[1]
+        assert assistant["role"] == "assistant"
+        assert assistant["tool_calls"][0]["id"] == "call_1"
+        assert assistant["reasoning_content"] == MISSING_REASONING_PLACEHOLDER
+
+    def test_real_reasoning_is_not_overwritten(self, tf):
+        result = tf.transform_input([
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run it"}]},
+            {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "real chain"}]},
+            {"type": "function_call", "name": "shell", "call_id": "call_1", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+        ])
+
+        assistant = [m for m in result if m.get("role") == "assistant"][0]
+        assert assistant["reasoning_content"] == "real chain"
+
+    def test_plain_assistant_message_is_left_alone(self, tf):
+        result = tf.transform_input([
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "thanks"}]},
+        ])
+
+        assistant = result[0]
+        assert "tool_calls" not in assistant
+        assert "reasoning_content" not in assistant
