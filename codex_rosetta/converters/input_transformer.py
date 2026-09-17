@@ -438,4 +438,5 @@ def _extract_reasoning_text(item: dict[str, Any]) -> str:
                     parts.append(text)
             elif isinstance(entry, str) and entry:
                 parts.append(entry)
-    return "\n".join(parts)
+    # Reasoning parts are fragments of one stream, so they concatenate as-is.
+    return "".join(parts)
