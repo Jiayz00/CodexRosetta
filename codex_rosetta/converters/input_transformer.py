@@ -176,6 +176,7 @@ class InputTransformer:
             pending_trailing = []
             pending_reasoning = ""
 
+
         def close_completed_tool_turn() -> None:
             """Flush a finished tool turn before a new assistant item starts.
 
