@@ -642,3 +642,53 @@ def test_router_returns_400_for_unsupported_parameter():
     assert body["error"]["code"] == "unsupported_parameter"
     assert body["error"]["param"] == "context_management"
     assert body["error"]["type"] == "invalid_request_error"
+
+
+TOOL_TURN_ONE = [
+    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "start"}]},
+    {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "first"}]},
+    {"type": "function_call", "call_id": LONG_CALL_ID + "1", "name": "shell",
+     "arguments": '{"cmd": "a"}'},
+    {"type": "function_call_output", "call_id": LONG_CALL_ID + "1", "output": "out-1"},
+]
+
+TOOL_TURN_TWO = TOOL_TURN_ONE + [
+    {"type": "reasoning", "id": "rs_2", "summary": [{"type": "summary_text", "text": "second"}]},
+    {"type": "function_call", "call_id": LONG_CALL_ID + "2", "name": "shell",
+     "arguments": '{"cmd": "b"}'},
+    {"type": "function_call_output", "call_id": LONG_CALL_ID + "2", "output": "out-2"},
+]
+
+
+async def test_replayed_tool_turns_stay_append_only():
+    """A later turn must extend the previous request, never rewrite it.
+
+    Rewriting an already-sent assistant message invalidates the upstream
+    prefix cache for the rest of the conversation (measured as a 25%+ drop in
+    cache-read tokens once the gateway started merging replayed tool turns).
+    """
+    converter = RequestConverter()
+    first, _ = await converter.convert({"model": "deepseek-flash", "input": TOOL_TURN_ONE})
+    second, _ = await converter.convert({"model": "deepseek-flash", "input": TOOL_TURN_TWO})
+
+    assert [m["role"] for m in first["messages"]] == ["user", "assistant", "tool"]
+    assert second["messages"][: len(first["messages"])] == first["messages"]
+    assert [m["role"] for m in second["messages"]] == ["user", "assistant", "tool", "assistant", "tool"]
+
+
+async def test_parallel_tool_calls_from_one_turn_stay_grouped():
+    """Two calls of the same turn still share one assistant message."""
+    items = [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "start"}]},
+        {"type": "function_call", "call_id": LONG_CALL_ID + "1", "name": "shell",
+         "arguments": '{"cmd": "a"}'},
+        {"type": "function_call", "call_id": LONG_CALL_ID + "2", "name": "shell",
+         "arguments": '{"cmd": "b"}'},
+        {"type": "function_call_output", "call_id": LONG_CALL_ID + "1", "output": "out-1"},
+        {"type": "function_call_output", "call_id": LONG_CALL_ID + "2", "output": "out-2"},
+    ]
+    converter = RequestConverter()
+    body, _ = await converter.convert({"model": "deepseek-flash", "input": items})
+
+    assert [m["role"] for m in body["messages"]] == ["user", "assistant", "tool", "tool"]
+    assert len(body["messages"][1]["tool_calls"]) == 2

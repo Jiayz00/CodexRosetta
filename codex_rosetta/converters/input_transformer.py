@@ -104,6 +104,17 @@ class InputTransformer:
             pending_call_ids = set()
             pending_trailing = []
 
+        def close_completed_tool_turn() -> None:
+            """Flush a finished tool turn before a new assistant item starts.
+
+            Once a tool output has arrived the pending assistant message is
+            already complete; folding a later call into it would rewrite a
+            message that was sent in an earlier request, which invalidates the
+            upstream prefix cache for the whole conversation tail.
+            """
+            if pending_tool_calls and pending_trailing:
+                flush_pending()
+
         for index, item in enumerate(items):
             if not isinstance(item, dict):
                 # Treat as simple string content
@@ -145,6 +156,7 @@ class InputTransformer:
                     )
 
             elif item_type == "function_call":
+                close_completed_tool_turn()
                 call_id = normalize_call_id(item.get("call_id") or item.get("id"))
                 pending_tool_calls.append({
                     "id": call_id,
@@ -160,6 +172,7 @@ class InputTransformer:
                 known_call_ids.add(call_id)
 
             elif item_type == "custom_tool_call":
+                close_completed_tool_turn()
                 call_id = normalize_call_id(item.get("call_id") or item.get("id"))
                 pending_tool_calls.append({
                     "id": call_id,
@@ -173,6 +186,7 @@ class InputTransformer:
                 known_call_ids.add(call_id)
 
             elif item_type == "web_search_call":
+                close_completed_tool_turn()
                 # Built-in search results are replayed as a simulated function
                 # call plus its tool result so the model keeps the context.
                 call_id = normalize_call_id(item.get("call_id") or item.get("id"))
@@ -227,6 +241,7 @@ class InputTransformer:
                     messages.append({"role": "user", "content": content})
 
             elif item_type == "reasoning":
+                close_completed_tool_turn()
                 # Reasoning replay is handled via reasoning_content backfill
                 # (see input transformer reasoning support); nothing to emit here.
                 logger.debug("reasoning_item_skipped", index=index)
