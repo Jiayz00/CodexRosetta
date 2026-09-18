@@ -12,6 +12,26 @@ from codex_rosetta.utils.logging import get_logger
 logger = get_logger("upstream")
 
 
+def _raise_for_upstream_error(response: httpx.Response) -> None:
+    """Raise an HTTPStatusError that carries the upstream's own error text.
+
+    httpx's default message ("Client error '400 Bad Request' for url ...") hides
+    the reason the upstream gave, which made real failures impossible to
+    diagnose from the client. The exception type is unchanged so existing
+    handlers keep working.
+    """
+    if response.status_code < 400:
+        return
+    detail = " ".join((response.text or "").split())[:600]
+    message = (
+        f"Client error '{response.status_code} {response.reason_phrase}' "
+        f"for url '{response.request.url}'"
+    )
+    if detail:
+        message = f"{message}: {detail}"
+    raise httpx.HTTPStatusError(message, request=response.request, response=response)
+
+
 class UpstreamClient:
     """Async HTTP client for forwarding requests to the upstream Chat Completions API."""
 
@@ -72,15 +92,14 @@ class UpstreamClient:
             duration_ms=duration_ms,
         )
 
+        response = await self._retry_without_forced_tool_choice(response, adapted, headers)
         if response.status_code >= 400:
-            error_body = response.text
             self._log.error(
                 "upstream_error_response",
                 status_code=response.status_code,
-                error_body=error_body[:2000],
+                error_body=response.text[:2000],
             )
-
-        response.raise_for_status()
+        _raise_for_upstream_error(response)
 
         data = response.json()
         result = self._adapter.adapt_response(data)
@@ -106,27 +125,76 @@ class UpstreamClient:
         if self._log_upstream_requests:
             self._log.debug("upstream_request_body", body=adapted)
 
-        async with self._client.stream(
-            "POST",
-            "/chat/completions",
-            json=adapted,
-            headers=headers,
-        ) as response:
-            if response.status_code >= 400:
-                await response.aread()
-                error_body = response.text
-                self._log.error(
-                    "upstream_error_response",
-                    status_code=response.status_code,
-                    error_body=error_body[:2000],
-                )
-            response.raise_for_status()
-            chunk_count = 0
-            async for chunk in response.aiter_bytes():
-                chunk_count += 1
-                yield chunk
+        async for chunk in self._stream_once(adapted, headers):
+            yield chunk
 
-            self._log.info("upstream_stream_ended", chunk_count=chunk_count)
+    async def _retry_without_forced_tool_choice(
+        self, response: httpx.Response, body: dict[str, Any], headers: dict[str, str]
+    ) -> httpx.Response:
+        """Retry once with tool_choice=auto when the upstream rejects forcing.
+
+        Strict upstreams answer 400 with "use tool_choice=auto" instead of
+        degrading on their own; downgrading keeps the turn alive instead of
+        killing the whole conversation.
+        """
+        if not self._should_downgrade_tool_choice(body, response):
+            return response
+        self._log.warning(
+            "tool_choice_downgraded",
+            upstream_status=response.status_code,
+            tool_choice=body.get("tool_choice"),
+        )
+        return await self._client.post(
+            "/chat/completions", json={**body, "tool_choice": "auto"}, headers=headers
+        )
+
+    @staticmethod
+    def _should_downgrade_tool_choice(body: dict[str, Any], response: httpx.Response) -> bool:
+        if response.status_code != 400:
+            return False
+        choice = body.get("tool_choice")
+        if not choice or choice == "auto":
+            return False
+        detail = (response.text or "").lower()
+        return "tool_choice" in detail or "强制选择" in detail
+
+    async def _stream_once(
+        self, adapted: dict[str, Any], headers: dict[str, str]
+    ) -> AsyncIterator[bytes]:
+        """Stream one upstream call, downgrading a rejected forced tool_choice once."""
+        attempt = 0
+        while True:
+            async with self._client.stream(
+                "POST",
+                "/chat/completions",
+                json=adapted,
+                headers=headers,
+            ) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    self._log.error(
+                        "upstream_error_response",
+                        status_code=response.status_code,
+                        error_body=response.text[:2000],
+                    )
+                    if attempt == 0 and self._should_downgrade_tool_choice(adapted, response):
+                        self._log.warning(
+                            "tool_choice_downgraded",
+                            upstream_status=response.status_code,
+                            tool_choice=adapted.get("tool_choice"),
+                        )
+                        adapted = {**adapted, "tool_choice": "auto"}
+                        attempt += 1
+                        continue
+                    _raise_for_upstream_error(response)
+
+                chunk_count = 0
+                async for chunk in response.aiter_bytes():
+                    chunk_count += 1
+                    yield chunk
+
+                self._log.info("upstream_stream_ended", chunk_count=chunk_count)
+                return
 
     async def close(self) -> None:
         await self._client.aclose()
