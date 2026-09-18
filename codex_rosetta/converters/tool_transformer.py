@@ -421,6 +421,12 @@ class ToolTransformer:
 
         if tc_type == "function":
             name = tool_choice.get("name", "")
+            namespace = tool_choice.get("namespace") or ""
+            if namespace and context is not None:
+                # Client sends the bare tool name plus its namespace; the tool
+                # list upstream was flattened, so the forced choice must use the
+                # same flattened name or the upstream rejects the request.
+                name = context.flatten_namespace_tool(namespace, name)
             return {
                 "type": "function",
                 "function": {"name": self._forward_name(name, context)},
