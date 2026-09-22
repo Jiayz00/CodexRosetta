@@ -19,6 +19,33 @@ FORCE_ANSWER_INSTRUCTION = (
     "请直接依据已有知识作答，并简要说明本次未能联网搜索。"
 )
 
+SEARCH_RESULTS_NOTE = "以下是已经获取的网络搜索结果，请勿再次调用搜索工具："
+
+
+def build_search_results_message(entries: list[tuple[str, str]]) -> dict[str, Any]:
+    """Carry search results upstream as a plain message.
+
+    Replaying the internal search call as a function call would be more
+    faithful, but relay-side Responses->Chat bridges cannot express it: the
+    rebuilt assistant tool_calls message trips thinking-mode upstreams
+    ("The `reasoning_content` in the thinking mode must be passed back to the
+    API") and relays reject a replayed ``tool_call_id`` that collides with an
+    earlier round. A message survives every bridge and carries the same text;
+    the client still sees standard ``web_search_call`` items.
+    """
+    blocks: list[str] = []
+    for query, body in entries:
+        header = f"查询: {query}" if query else ""
+        blocks.append("\n".join(part for part in (header, body or "（无结果）") if part))
+    return {
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": f"{SEARCH_RESULTS_NOTE}\n\n" + "\n\n".join(blocks),
+        }],
+    }
+
 
 def build_search_function_tool() -> dict[str, Any]:
     """Responses-shaped function tool that stands in for built-in web_search."""
@@ -27,12 +54,7 @@ def build_search_function_tool() -> dict[str, Any]:
 
 
 def _restore_search_history(items: list[Any]) -> list[Any]:
-    """Turn replayed web_search_call history into plain function-call history.
-
-    Built-in search items are a Codex/OpenAI shape the upstream does not accept
-    on the way back in, so they travel as an ordinary function call plus its
-    result.
-    """
+    """Turn replayed web_search_call history into plain message history."""
     restored: list[Any] = []
     for item in items:
         if not isinstance(item, dict) or item.get("type") != "web_search_call":
@@ -40,23 +62,14 @@ def _restore_search_history(items: list[Any]) -> list[Any]:
             continue
         action = item.get("action") or {}
         query = " ".join(str(q) for q in (action.get("queries") or []))
-        call_id = str(item.get("id") or generate_item_id("function_call"))
         urls = [
             str(src.get("url"))
             for src in (action.get("sources") or [])
             if isinstance(src, dict) and src.get("url")
         ]
-        restored.append({
-            "type": "function_call",
-            "call_id": call_id,
-            "name": INTERNAL_SEARCH_NAME,
-            "arguments": json.dumps({"query": query}, ensure_ascii=False),
-        })
-        restored.append({
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": "\n".join(urls) if urls else "（本次搜索未返回来源）",
-        })
+        restored.append(build_search_results_message([
+            (query, "\n".join(urls) if urls else "（本次搜索未返回来源）"),
+        ]))
     return restored
 
 

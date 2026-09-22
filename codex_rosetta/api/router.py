@@ -21,6 +21,7 @@ from codex_rosetta.converters.responses_mux import (
     INTERNAL_SEARCH_NAME,
     ResponsesStreamMux,
     SearchCallState,
+    build_search_results_message,
     build_web_search_item,
     is_internal_search_item,
     normalize_responses_request,
@@ -955,26 +956,14 @@ def _append_responses_search_exchange(
     calls: list[SearchCallState],
     results_map: dict[str, str],
 ) -> dict[str, Any]:
-    """Append the internal search call and its results to the next round input.
-
-    Only the fields every Responses-compatible upstream accepts are emitted:
-    strict relays reject unknown ones.
-    """
+    """Append this round's search results to the next round's input."""
     updated = dict(body)
     items = list(updated.get("input") or [])
-    for call in calls:
-        items.append({
-            "type": "function_call",
-            "call_id": call.call_id,
-            "name": INTERNAL_SEARCH_NAME,
-            "arguments": call.arguments or "{}",
-        })
-    for call in calls:
-        items.append({
-            "type": "function_call_output",
-            "call_id": call.call_id,
-            "output": results_map.get(call.call_id, ""),
-        })
+    items.append(build_search_results_message([
+        (str(parse_arguments(call.arguments).get("query") or ""),
+         results_map.get(call.call_id, ""))
+        for call in calls
+    ]))
     updated["input"] = items
     return updated
 

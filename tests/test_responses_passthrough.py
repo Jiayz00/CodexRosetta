@@ -19,6 +19,7 @@ from codex_rosetta.audit.logger import NoOpAuditLogger
 from codex_rosetta.config import Settings, get_settings
 from codex_rosetta.converters.responses_mux import (
     INTERNAL_SEARCH_NAME,
+    SEARCH_RESULTS_NOTE,
     ResponsesStreamMux,
     normalize_responses_request,
     strip_search_function_tool,
@@ -293,11 +294,12 @@ def test_normalize_restores_replayed_search_history():
     normalized, _ = normalize_responses_request(body, search_enabled=True)
 
     kinds = [item["type"] for item in normalized["input"]]
-    assert kinds == ["message", "function_call", "function_call_output"]
-    call, output = normalized["input"][1], normalized["input"][2]
-    assert call["name"] == INTERNAL_SEARCH_NAME
-    assert call["call_id"] == output["call_id"] == "ws_prev"
-    assert "https://example.com/1" in output["output"]
+    assert kinds == ["message", "message"]
+    text = normalized["input"][1]["content"][0]["text"]
+    assert text.startswith(SEARCH_RESULTS_NOTE)
+    assert "AI news" in text
+    assert "https://example.com/1" in text
+    assert INTERNAL_SEARCH_NAME not in json.dumps(normalized["input"])
 
 
 def test_strip_search_function_tool_forces_answer():
@@ -538,10 +540,45 @@ async def test_non_streaming_loop_replays_search_output(monkeypatch):
 
     second = upstream.requests[1]
     kinds = [item["type"] for item in second["input"]]
-    assert kinds[-2:] == ["function_call", "function_call_output"]
-    assert second["input"][-2]["call_id"] == second["input"][-1]["call_id"] == "call_1"
-    assert "S1" in second["input"][-1]["output"]
+    # results travel as a message: a replayed tool call trips relay-side
+    # Responses->Chat bridges (reasoning_content / repeated tool_call_id)
+    assert kinds == ["message", "message"]
+    text = second["input"][-1]["content"][0]["text"]
+    assert text.startswith(SEARCH_RESULTS_NOTE)
+    assert "AI news" in text
+    assert "S1" in text
     assert INTERNAL_SEARCH_NAME not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_search_results_accumulate_without_tool_replay(monkeypatch):
+    monkeypatch.setattr(router_module, "get_settings", lambda: Settings(
+        UPSTREAM_API_MODE="responses", WEB_SEARCH_MAX_ROUNDS=3
+    ))
+    upstream = FakeResponsesUpstream([
+        search_response("call_same"),
+        search_response("call_same"),
+        answer_response(),
+    ])
+    provider = StubSearchProvider([ok_response(), ok_response()])
+
+    await _responses_search_rounds(
+        upstream, normalized_body(), LOG, NoOpAuditLogger(), provider
+    )
+
+    inputs = upstream.requests[-1]["input"]
+    results = [
+        item for item in inputs
+        if isinstance(item, dict)
+        and item.get("type") == "message"
+        and item.get("content")
+        and str(item["content"][0].get("text", "")).startswith(SEARCH_RESULTS_NOTE)
+    ]
+    assert len(results) == 2
+    assert not [
+        item for item in inputs
+        if item.get("type") in {"function_call", "function_call_output"}
+    ]
 
 
 @pytest.mark.asyncio
