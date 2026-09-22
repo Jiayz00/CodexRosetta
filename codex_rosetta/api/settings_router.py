@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -22,6 +22,8 @@ class SettingsResponse(BaseModel):
 
 
 class SettingsUpdateRequest(BaseModel):
+    UPSTREAM_API_MODE: Literal["chat_completions", "responses"] | None = None
+    UPSTREAM_RESPONSES_DROP_REASONING_EFFORT: bool | None = None
     LOG_LEVEL: str | None = None
     LOG_UPSTREAM_REQUESTS: bool | None = None
     LOG_UPSTREAM_RESPONSES: bool | None = None
@@ -50,6 +52,12 @@ async def get_current_settings() -> SettingsResponse:
 @router.put("")
 async def update_current_settings(req: SettingsUpdateRequest) -> SettingsResponse:
     overrides: dict[str, Any] = {}
+    if req.UPSTREAM_API_MODE is not None:
+        overrides["UPSTREAM_API_MODE"] = req.UPSTREAM_API_MODE
+    if req.UPSTREAM_RESPONSES_DROP_REASONING_EFFORT is not None:
+        overrides["UPSTREAM_RESPONSES_DROP_REASONING_EFFORT"] = (
+            req.UPSTREAM_RESPONSES_DROP_REASONING_EFFORT
+        )
     if req.LOG_LEVEL is not None:
         overrides["LOG_LEVEL"] = req.LOG_LEVEL
     if req.LOG_UPSTREAM_REQUESTS is not None:

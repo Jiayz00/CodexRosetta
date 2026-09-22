@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     UPSTREAM_BASE_URL: str = "https://api.openai.com/v1"
     UPSTREAM_API_KEY: str = ""
     UPSTREAM_PROVIDER: Literal["openai", "anthropic", "google", "other"] = "openai"
+    # Wire protocol used for the upstream hop. "chat_completions" preserves the
+    # historical converter path; "responses" forwards Responses requests as-is.
+    UPSTREAM_API_MODE: Literal["chat_completions", "responses"] = "chat_completions"
+    # Some Responses-compatible upstreams reject reasoning.effort outright.
+    # Dropping the object keeps the request usable; the model still emits its
+    # default reasoning summary.
+    UPSTREAM_RESPONSES_DROP_REASONING_EFFORT: bool = False
 
     # Optional Redis
     REDIS_URL: Optional[str] = None

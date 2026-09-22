@@ -61,12 +61,14 @@ async def parse_upstream_sse_stream(
 
         while "\n\n" in buffer:
             event_block, buffer = buffer.split("\n\n", 1)
-            parsed = parse_sse_lines(event_block)
+            # The blank line is what makes parse_sse_lines emit the event, so
+            # restore the terminator the split just removed.
+            parsed = parse_sse_lines(event_block + "\n\n")
             for event_type, data in parsed:
                 yield event_type, data
 
     # Handle remaining buffer
     if buffer.strip():
-        parsed = parse_sse_lines(buffer)
+        parsed = parse_sse_lines(buffer + "\n\n")
         for event_type, data in parsed:
             yield event_type, data

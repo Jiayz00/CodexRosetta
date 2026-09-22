@@ -16,6 +16,18 @@ from codex_rosetta.config import get_settings
 from codex_rosetta.converters.request_converter import RequestConverter
 from codex_rosetta.converters.response_converter import ResponseConverter
 from codex_rosetta.converters.stream_converter import StreamConverter
+from codex_rosetta.converters.responses_mux import (
+    FORCE_ANSWER_INSTRUCTION,
+    INTERNAL_SEARCH_NAME,
+    ResponsesStreamMux,
+    SearchCallState,
+    build_web_search_item,
+    is_internal_search_item,
+    normalize_responses_request,
+    parse_arguments,
+    strip_search_function_tool,
+    to_search_tool_call,
+)
 from codex_rosetta.models.common import (
     ROSETTA_TOOL_PREFIX,
     UnsupportedParameterError,
@@ -32,9 +44,9 @@ from codex_rosetta.search.pool import (
     SearchProviderPool,
     get_search_pool,
 )
-from codex_rosetta.utils.id_generation import generate_response_id
+from codex_rosetta.utils.id_generation import generate_item_id, generate_response_id
 from codex_rosetta.utils.logging import get_logger
-from codex_rosetta.utils.sse import format_sse_event
+from codex_rosetta.utils.sse import format_sse_event, parse_upstream_sse_stream
 
 logger = get_logger("router")
 
@@ -116,6 +128,11 @@ async def create_response(request: Request):
         has_conversation=bool(body.get("conversation")),
         has_instructions=bool(body.get("instructions")),
     )
+
+    if get_settings().UPSTREAM_API_MODE == "responses":
+        return await _responses_mode_response(
+            body, log, auditor, _get_search_provider()
+        )
 
     upstream = get_upstream_client()
     store = get_conversation_store()
@@ -836,3 +853,367 @@ async def _call_upstream_with_retry(
                 trimmed_count=trim_count,
                 remaining_messages=len(system_msgs) + len(non_system),
             )
+
+
+async def _responses_mode_response(
+    body: dict[str, Any],
+    log: Any,
+    auditor: Any,
+    search_provider: SearchProvider | None,
+) -> Any:
+    """Forward a Responses request as-is, looping only for Tavily search.
+
+    ``UPSTREAM_API_MODE=responses`` skips the Responses<->Chat conversion
+    entirely; the only edit is swapping built-in search tools for the internal
+    function tool the upstream can actually execute.
+    """
+    upstream = get_upstream_client()
+    normalized, wants_search = normalize_responses_request(
+        body, search_enabled=search_provider is not None
+    )
+    search_loop = bool(wants_search and search_provider)
+
+    log.info(
+        "responses_passthrough",
+        model=normalized.get("model"),
+        stream=normalized.get("stream", False),
+        search_loop=search_loop,
+        tool_count=len(normalized.get("tools") or []),
+        input_count=len(normalized.get("input") or []),
+    )
+
+    if normalized.get("stream", False):
+        generator = (
+            _stream_responses_search(
+                upstream, normalized, log, auditor, search_provider
+            )
+            if search_loop
+            else _stream_responses_verbatim(upstream, normalized, log)
+        )
+        return StreamingResponse(
+            generator,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    try:
+        if search_loop:
+            data = await _responses_search_rounds(
+                upstream, normalized, log, auditor, search_provider
+            )
+        else:
+            data = await upstream.responses(normalized)
+    except httpx.HTTPStatusError as e:
+        log.warning(
+            "upstream_error",
+            mode="responses",
+            status=e.response.status_code,
+            error=str(e),
+        )
+        return JSONResponse(
+            status_code=e.response.status_code,
+            content=_make_error_response(
+                generate_response_id(), "upstream_error", str(e)
+            ),
+        )
+
+    output_items = data.get("output") or []
+    log.info(
+        "response_sent",
+        mode="responses",
+        status=data.get("status"),
+        output_count=len(output_items),
+        output_types=[item.get("type") for item in output_items if isinstance(item, dict)],
+    )
+    return JSONResponse(content=data)
+
+
+async def _stream_responses_verbatim(
+    upstream: Any, body: dict[str, Any], log: Any
+) -> Any:
+    """Forward upstream Responses SSE untouched, reporting errors as events.
+
+    Without this an upstream 400 would surface to the client as a bare
+    "stream disconnected" with no reason attached.
+    """
+    mux = ResponsesStreamMux()
+    try:
+        async for chunk in upstream.responses_stream(body):
+            yield chunk
+    except Exception as e:  # noqa: BLE001 - the stream must always terminate
+        log.error("stream_error", mode="responses", error=str(e), exc_info=True)
+        etype, event = mux.build_failed_event(str(e))
+        yield format_sse_event(etype, event)
+
+
+def _append_responses_search_exchange(
+    body: dict[str, Any],
+    calls: list[SearchCallState],
+    results_map: dict[str, str],
+) -> dict[str, Any]:
+    """Append the internal search call and its results to the next round input.
+
+    Only the fields every Responses-compatible upstream accepts are emitted:
+    strict relays reject unknown ones.
+    """
+    updated = dict(body)
+    items = list(updated.get("input") or [])
+    for call in calls:
+        items.append({
+            "type": "function_call",
+            "call_id": call.call_id,
+            "name": INTERNAL_SEARCH_NAME,
+            "arguments": call.arguments or "{}",
+        })
+    for call in calls:
+        items.append({
+            "type": "function_call_output",
+            "call_id": call.call_id,
+            "output": results_map.get(call.call_id, ""),
+        })
+    updated["input"] = items
+    return updated
+
+
+def _to_search_states(items: list[dict[str, Any]]) -> list[SearchCallState]:
+    return [
+        SearchCallState(
+            item_id=str(item.get("id") or ""),
+            call_id=str(item.get("call_id") or ""),
+            output_index=0,
+            web_search_id=generate_item_id("web_search"),
+            arguments=str(item.get("arguments") or ""),
+        )
+        for item in items
+    ]
+
+
+async def _responses_search_rounds(
+    upstream: Any,
+    body: dict[str, Any],
+    log: Any,
+    auditor: Any,
+    search_provider: SearchProvider | None,
+) -> dict[str, Any]:
+    """Non-streaming Responses search loop, mirroring the streaming rules."""
+    settings = get_settings()
+    max_rounds = max(1, int(settings.WEB_SEARCH_MAX_ROUNDS or 1))
+    max_results = int(settings.WEB_SEARCH_MAX_RESULTS or 5)
+
+    current = body
+    accumulated: list[dict[str, Any]] = []
+    consecutive_failures = 0
+    rounds = 0
+    forced = False
+    response: dict[str, Any] = {}
+
+    for round_index in range(max_rounds + 2):
+        response = await upstream.responses(current)
+        output = [i for i in (response.get("output") or []) if isinstance(i, dict)]
+        search_items = [i for i in output if is_internal_search_item(i)]
+        if not search_items:
+            accumulated.extend(output)
+            break
+
+        calls = _to_search_states(search_items)
+        client_calls = [
+            i
+            for i in output
+            if not is_internal_search_item(i)
+            and i.get("type") in {"function_call", "custom_tool_call"}
+        ]
+
+        log.info(
+            "search_loop_round",
+            mode="non_streaming",
+            round=round_index + 1,
+            search_calls=len(calls),
+            forced=forced,
+        )
+
+        if forced:
+            results_map = {
+                call.call_id: format_search_unavailable("本轮已停止联网搜索，请直接作答")
+                for call in calls
+            }
+            sources_map: dict[str, list[dict[str, Any]]] = {}
+            failures = len(calls)
+        elif client_calls:
+            log.info(
+                "web_search_mixed_round",
+                mode="non_streaming",
+                search_calls=len(calls),
+                client_tool_calls=len(client_calls),
+            )
+            results_map, sources_map, failures = {}, {}, 0
+        else:
+            rounds += 1
+            results_map, sources_map, failures = await _execute_searches(
+                [to_search_tool_call(call) for call in calls],
+                search_provider,
+                max_results,
+                log,
+                auditor,
+            )
+
+        for item in output:
+            if is_internal_search_item(item):
+                call = next(
+                    c for c in calls if c.item_id == str(item.get("id") or "")
+                )
+                accumulated.append(build_web_search_item(
+                    call.web_search_id,
+                    parse_arguments(call.arguments),
+                    sources_map.get(call.call_id),
+                ))
+            else:
+                accumulated.append(item)
+
+        if client_calls:
+            break
+
+        if failures == len(calls):
+            consecutive_failures += 1
+        else:
+            consecutive_failures = 0
+
+        current = _append_responses_search_exchange(current, calls, results_map)
+
+        if not forced and (consecutive_failures >= 2 or rounds >= max_rounds):
+            current = strip_search_function_tool(current, FORCE_ANSWER_INSTRUCTION)
+            forced = True
+            log.warning(
+                "search_loop_forcing_answer",
+                mode="non_streaming",
+                round=rounds,
+                max_rounds=max_rounds,
+                consecutive_failures=consecutive_failures,
+            )
+    else:
+        log.warning("search_loop_unanswered", mode="non_streaming", rounds=rounds)
+
+    merged = dict(response)
+    merged["output"] = accumulated
+    return merged
+
+
+async def _stream_responses_search(
+    upstream: Any,
+    body: dict[str, Any],
+    log: Any,
+    auditor: Any,
+    search_provider: SearchProvider | None,
+) -> Any:
+    """Stream Responses rounds through one logical response while searching."""
+    settings = get_settings()
+    max_rounds = max(1, int(settings.WEB_SEARCH_MAX_ROUNDS or 1))
+    max_results = int(settings.WEB_SEARCH_MAX_RESULTS or 5)
+
+    mux = ResponsesStreamMux()
+    current = body
+    consecutive_failures = 0
+    rounds = 0
+    forced = False
+    start = time.monotonic()
+
+    try:
+        for round_index in range(max_rounds + 2):
+            async for event_type, data in parse_upstream_sse_stream(
+                upstream.responses_stream(current)
+            ):
+                if data is None:
+                    continue
+                for etype, event in mux.process_event(event_type, data, round_index):
+                    yield format_sse_event(etype, event)
+
+            result = mux.finalize_round()
+            if result.terminal_event is not None:
+                log.warning(
+                    "responses_upstream_terminal",
+                    event=result.terminal_event[0],
+                )
+                return
+            if not result.search_calls:
+                break
+            if result.client_calls:
+                log.info(
+                    "web_search_mixed_round",
+                    mode="streaming",
+                    search_calls=len(result.search_calls),
+                    client_tool_calls=len(result.client_calls),
+                )
+                for etype, event in mux.complete_search_calls({}, {}):
+                    yield format_sse_event(etype, event)
+                break
+
+            log.info(
+                "search_loop_round",
+                mode="streaming",
+                round=round_index + 1,
+                search_calls=len(result.search_calls),
+                forced=forced,
+            )
+
+            if forced:
+                results_map = {
+                    call.call_id: format_search_unavailable(
+                        "本轮已停止联网搜索，请直接作答"
+                    )
+                    for call in result.search_calls
+                }
+                sources_map: dict[str, list[dict[str, Any]]] = {}
+                failures = len(result.search_calls)
+            else:
+                rounds += 1
+                results_map, sources_map, failures = await _execute_searches(
+                    [to_search_tool_call(call) for call in result.search_calls],
+                    search_provider,
+                    max_results,
+                    log,
+                    auditor,
+                )
+
+            for etype, event in mux.complete_search_calls(results_map, sources_map):
+                yield format_sse_event(etype, event)
+
+            if failures == len(result.search_calls):
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
+
+            current = _append_responses_search_exchange(
+                current, result.search_calls, results_map
+            )
+
+            if not forced and (consecutive_failures >= 2 or rounds >= max_rounds):
+                current = strip_search_function_tool(current, FORCE_ANSWER_INSTRUCTION)
+                forced = True
+                log.warning(
+                    "search_loop_forcing_answer",
+                    mode="streaming",
+                    round=rounds,
+                    max_rounds=max_rounds,
+                    consecutive_failures=consecutive_failures,
+                )
+
+            mux.start_next_round()
+        else:
+            log.warning("search_loop_unanswered", mode="streaming", rounds=rounds)
+
+        etype, event = mux.build_completed_event()
+        yield format_sse_event(etype, event)
+
+        log.info(
+            "stream_completed",
+            mode="responses",
+            search_rounds=rounds,
+            duration_ms=round((time.monotonic() - start) * 1000),
+        )
+    except Exception as e:  # noqa: BLE001 - the stream must always terminate
+        log.error("stream_error", mode="responses", error=str(e), exc_info=True)
+        etype, event = mux.build_failed_event(str(e))
+        yield format_sse_event(etype, event)

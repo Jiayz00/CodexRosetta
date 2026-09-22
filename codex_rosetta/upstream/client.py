@@ -64,6 +64,18 @@ class UpstreamClient:
         return headers
 
     @staticmethod
+    def _apply_cache_headers(
+        body: dict[str, Any], headers: dict[str, str]
+    ) -> dict[str, Any]:
+        """Copy a request body and expose its cache identity to compatible gateways."""
+        cache_key = str(body.get("prompt_cache_key") or "").strip()
+        if cache_key:
+            headers.setdefault("session_id", cache_key)
+            # sub2api forwards this only to the official OpenCode origin.
+            headers.setdefault("X-OpenCode-Session", cache_key)
+        return body
+
+    @staticmethod
     def _finalize_request(
         adapted: dict[str, Any], headers: dict[str, str]
     ) -> dict[str, Any]:
@@ -76,13 +88,22 @@ class UpstreamClient:
         ``session_id`` header keeps the same sticky/cache identity for the
         gateway while the wire body stays within the chat-completions schema.
         """
-        if "prompt_cache_key" not in adapted:
-            return adapted
-
         body = dict(adapted)
-        cache_key = str(body.pop("prompt_cache_key") or "").strip()
-        if cache_key:
-            headers.setdefault("session_id", cache_key)
+        UpstreamClient._apply_cache_headers(body, headers)
+        body.pop("prompt_cache_key", None)
+        return body
+
+    def _finalize_responses_request(
+        self, adapted: dict[str, Any], headers: dict[str, str]
+    ) -> dict[str, Any]:
+        """Normalize a native Responses request for the upstream hop."""
+        body = dict(adapted)
+        self._apply_cache_headers(body, headers)
+        if self._settings.UPSTREAM_RESPONSES_DROP_REASONING_EFFORT:
+            # tokenrhythm's Responses endpoint rejects reasoning.effort. The
+            # model still emits a default reasoning summary when the object is
+            # absent, so dropping it keeps the turn usable.
+            body.pop("reasoning", None)
         return body
 
     async def chat_completions(self, request_body: dict[str, Any]) -> dict[str, Any]:
@@ -154,8 +175,72 @@ class UpstreamClient:
         async for chunk in self._stream_once(adapted, headers):
             yield chunk
 
+    async def responses(self, request_body: dict[str, Any]) -> dict[str, Any]:
+        """Send a non-streaming request to upstream /v1/responses."""
+        headers = self._get_headers()
+        adapted = self._finalize_responses_request(
+            self._adapter.adapt_request(request_body), headers
+        )
+
+        self._log.info(
+            "upstream_responses_request_sent",
+            model=adapted.get("model"),
+            stream=adapted.get("stream", False),
+        )
+        if self._log_upstream_requests:
+            self._log.debug("upstream_responses_request_body", body=adapted)
+
+        start = time.monotonic()
+        response = await self._client.post("/responses", json=adapted, headers=headers)
+        duration_ms = round((time.monotonic() - start) * 1000)
+        self._log.info(
+            "upstream_responses_response_received",
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+        )
+
+        response = await self._retry_without_forced_tool_choice(
+            response, adapted, headers, path="/responses"
+        )
+        if response.status_code >= 400:
+            self._log.error(
+                "upstream_responses_error_response",
+                status_code=response.status_code,
+                error_body=response.text[:2000],
+            )
+        _raise_for_upstream_error(response)
+
+        data = response.json()
+        result = self._adapter.adapt_response(data)
+        if self._log_upstream_responses:
+            self._log.debug("upstream_responses_response_body", body=result)
+        return result
+
+    async def responses_stream(
+        self, request_body: dict[str, Any]
+    ) -> AsyncIterator[bytes]:
+        """Stream from upstream /v1/responses."""
+        headers = self._get_headers()
+        adapted = self._finalize_responses_request(
+            self._adapter.adapt_request(request_body), headers
+        )
+
+        self._log.info(
+            "upstream_responses_stream_started",
+            model=adapted.get("model"),
+        )
+        if self._log_upstream_requests:
+            self._log.debug("upstream_responses_request_body", body=adapted)
+
+        async for chunk in self._stream_once(adapted, headers, path="/responses"):
+            yield chunk
+
     async def _retry_without_forced_tool_choice(
-        self, response: httpx.Response, body: dict[str, Any], headers: dict[str, str]
+        self,
+        response: httpx.Response,
+        body: dict[str, Any],
+        headers: dict[str, str],
+        path: str = "/chat/completions",
     ) -> httpx.Response:
         """Retry once with tool_choice=auto when the upstream rejects forcing.
 
@@ -171,7 +256,7 @@ class UpstreamClient:
             tool_choice=body.get("tool_choice"),
         )
         return await self._client.post(
-            "/chat/completions", json={**body, "tool_choice": "auto"}, headers=headers
+            path, json={**body, "tool_choice": "auto"}, headers=headers
         )
 
     @staticmethod
@@ -185,14 +270,17 @@ class UpstreamClient:
         return "tool_choice" in detail or "强制选择" in detail
 
     async def _stream_once(
-        self, adapted: dict[str, Any], headers: dict[str, str]
+        self,
+        adapted: dict[str, Any],
+        headers: dict[str, str],
+        path: str = "/chat/completions",
     ) -> AsyncIterator[bytes]:
         """Stream one upstream call, downgrading a rejected forced tool_choice once."""
         attempt = 0
         while True:
             async with self._client.stream(
                 "POST",
-                "/chat/completions",
+                path,
                 json=adapted,
                 headers=headers,
             ) as response:
